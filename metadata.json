@@ -1,0 +1,6 @@
+{
+  "name": "DGI E-Echange",
+  "description": "Plateforme gouvernementale sécurisée pour les échanges entre la Direction Générale des Impôts et les contribuables.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

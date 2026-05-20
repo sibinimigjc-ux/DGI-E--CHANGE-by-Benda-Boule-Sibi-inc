@@ -1,0 +1,138 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ---------------------------------------------------------
+    // 1. GLOBAL HELPERS & SAFETY NETS
+    // ---------------------------------------------------------
+    
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+    
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function getUserData(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data;
+    }
+
+    function hasRole(uid, role) {
+      let data = getUserData(uid);
+      return data != null && data.role == role;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'sibinimigjc@gmail.com' ||
+        hasRole(request.auth.uid, 'admin')
+      );
+    }
+
+    function isAgent() {
+      return isSignedIn() && (
+        isAdmin() ||
+        hasRole(request.auth.uid, 'agent')
+      );
+    }
+
+    // ---------------------------------------------------------
+    // 2. VALIDATION HELPERS
+    // ---------------------------------------------------------
+
+    function isValidUser(data) {
+      return data.uid == request.auth.uid 
+        && data.email is string 
+        && (data.role == 'contributor' || isAdmin())
+        && data.displayName is string && data.displayName.size() <= 100
+        && data.isSetup is bool
+        && data.isActive is bool;
+    }
+
+    function isValidExchange(data) {
+      return data.senderId == request.auth.uid
+        && data.receiverId is string && data.receiverId.size() <= 128
+        && data.subject is string && data.subject.size() <= 200
+        && data.body is string && data.body.size() <= 10000
+        && data.createdAt == request.time;
+    }
+
+    function isValidInternalMsg(data) {
+      return data.senderId == request.auth.uid
+        && data.senderName is string
+        && data.channel in ['public', 'private']
+        && data.content is string && data.content.size() <= 5000
+        && data.createdAt == request.time;
+    }
+
+    // ---------------------------------------------------------
+    // 3. COLLECTION RULES
+    // ---------------------------------------------------------
+
+    // User Profiles
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId);
+      allow list: if isAgent(); // Agents can see taxpayers
+      allow create: if isSignedIn() && userId == request.auth.uid && isValidUser(incoming());
+      allow update: if isSignedIn() && (
+        (userId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'lastLogin', 'companyName', 'taxNumber', 'address', 'isSetup'])) ||
+        isAdmin()
+      );
+    }
+
+    // Exchanges (Taxpayer communications)
+    match /exchanges/{exchangeId} {
+      allow get: if isSignedIn() && isValidId(exchangeId) && (
+        existing().senderId == request.auth.uid || 
+        existing().receiverId == request.auth.uid ||
+        isAgent()
+      );
+      allow list: if isSignedIn() && (
+        // Contributor list: must filter by senderId in query (or receiverId)
+        resource.data.senderId == request.auth.uid || 
+        resource.data.receiverId == request.auth.uid ||
+        isAgent()
+      );
+      allow create: if isSignedIn() && isValidExchange(incoming());
+      allow update: if isAgent() && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['isRead', 'isTransferred', 'transferredAt'])
+      );
+      allow delete: if isAdmin();
+    }
+
+    // Internal Collaboration
+    match /internal_messages/{messageId} {
+      allow read: if isAgent() && isValidId(messageId) && (
+        existing().channel == 'public' ||
+        request.auth.uid in existing().participants
+      );
+      allow create: if isAgent() && isValidId(messageId) && isValidInternalMsg(incoming()) && (
+        incoming().channel == 'public' ||
+        request.auth.uid in incoming().participants
+      );
+      allow update, delete: if isAdmin();
+    }
+
+    // Configuration Manager
+    match /config/{configId} {
+      allow read: if true;
+      allow write: if isSignedIn() && (
+        request.auth.token.email == 'sibinimigjc@gmail.com' ||
+        isAdmin()
+      );
+    }
+  }
+}

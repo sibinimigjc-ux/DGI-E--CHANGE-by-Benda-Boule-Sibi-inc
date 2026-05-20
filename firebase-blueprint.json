@@ -1,0 +1,143 @@
+{
+  "entities": {
+    "AppUser": {
+      "title": "AppUser",
+      "description": "User profile containing role, permissions and metadata",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "agent", "contributor"] },
+        "permissions": { "type": "array", "items": { "type": "string" } },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "companyName": { "type": "string" },
+        "taxNumber": { "type": "string" },
+        "logoUrl": { "type": "string" },
+        "address": { "type": "string" },
+        "isSetup": { "type": "boolean" },
+        "isActive": { "type": "boolean" }
+      },
+      "required": ["uid", "email", "role", "displayName", "isSetup", "isActive"]
+    },
+    "Invitation": {
+      "title": "Invitation",
+      "description": "Pending user invitation with pre-defined role and permissions",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "agent"] },
+        "permissions": { "type": "array", "items": { "type": "string" } },
+        "status": { "type": "string", "enum": ["pending", "accepted"] },
+        "invitedBy": { "type": "string" },
+        "invitedByName": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["email", "role", "permissions", "status", "invitedBy", "createdAt"]
+    },
+    "Exchange": {
+      "title": "Exchange",
+      "description": "A single message within a conversation thread",
+      "type": "object",
+      "properties": {
+        "senderId": { "type": "string" },
+        "senderName": { "type": "string" },
+        "receiverId": { "type": "string" },
+        "body": { "type": "string" },
+        "attachmentUrl": { "type": "string" },
+        "attachmentName": { "type": "string" },
+        "status": { "type": "string", "enum": ["sent", "delivered", "read"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["senderId", "senderName", "receiverId", "body", "createdAt"]
+    },
+    "Conversation": {
+      "title": "Conversation",
+      "description": "A group of messages between a taxpayer and DGI on a specific subject",
+      "type": "object",
+      "properties": {
+        "participants": { "type": "array", "items": { "type": "string" } },
+        "contributorId": { "type": "string" },
+        "agentId": { "type": "string" },
+        "subject": { "type": "string" },
+        "lastUpdate": { "type": "string", "format": "date-time" },
+        "lastMessagePreview": { "type": "string" },
+        "isReadByContributor": { "type": "boolean" },
+        "isReadByDGI": { "type": "boolean" },
+        "status": { "type": "string", "enum": ["open", "closed", "archived"] }
+      },
+      "required": ["participants", "subject", "lastUpdate", "contributorId"]
+    },
+    "InternalMessage": {
+      "title": "InternalMessage",
+      "description": "Agent-to-agent internal chat messages",
+      "type": "object",
+      "properties": {
+        "senderId": { "type": "string" },
+        "senderName": { "type": "string" },
+        "senderRole": { "type": "string" },
+        "channel": { "type": "string", "enum": ["public", "private"] },
+        "participants": { "type": "array", "items": { "type": "string" } },
+        "text": { "type": "string" },
+        "threadId": { "type": "string" },
+        "replyTo": { "type": "object" },
+        "attachments": { "type": "array", "items": { "$ref": "Attachment" } },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["senderId", "senderName", "channel", "text", "createdAt"]
+    },
+    "ThemeConfig": {
+      "title": "ThemeConfig",
+      "description": "Application branding and display settings",
+      "type": "object",
+      "properties": {
+        "primary": { "type": "string" },
+        "secondary": { "type": "string" },
+        "font": { "type": "string" },
+        "logo": { "type": "string" },
+        "favicon": { "type": "string" },
+        "borderRadius": { "type": "number" },
+        "cardShadow": { "type": "string", "enum": ["none", "sm", "md", "lg", "xl", "2xl"] },
+        "componentPadding": { "type": "string", "enum": ["compact", "normal", "relaxed"] }
+      }
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "AppUser",
+      "description": "User profile documents"
+    },
+    "/conversations/{conversationId}": {
+      "schema": "Conversation",
+      "description": "Threaded conversations between taxpayers and DGI"
+    },
+    "/conversations/{conversationId}/messages/{messageId}": {
+      "schema": "Exchange",
+      "description": "Individual messages within a conversation thread"
+    },
+    "/internal_messages/{id}": {
+      "schema": "InternalMessage",
+      "description": "Private agent-to-agent messages"
+    },
+    "/invitations/{id}": {
+      "schema": "Invitation",
+      "description": "Pending user invitations"
+    },
+    "/canal_general_staff/{id}": {
+      "schema": "InternalMessage",
+      "description": "Public staff general channel messages"
+    },
+    "/agents/{id}": {
+      "schema": "AppUser",
+      "description": "Directory of official DGI agents"
+    },
+    "/contribuables/{id}": {
+      "schema": "AppUser",
+      "description": "Directory of registered taxpayers"
+    },
+    "/config/studio": {
+      "schema": "ThemeConfig",
+      "description": "Studio branding settings"
+    }
+  }
+}

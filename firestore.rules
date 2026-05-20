@@ -1,0 +1,196 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ---------------------------------------------------------
+    // 1. GLOBAL HELPERS & SAFETY NETS
+    // ---------------------------------------------------------
+    
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Health Check for Applet Boot
+    match /test/connection {
+      allow get: if true;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    // Master Admin Helper - Highly Optimized
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'sibinimigjc@gmail.com' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin')
+      );
+    }
+
+    // Agent/Admin Helper
+    function isAgent() {
+      return isSignedIn() && (
+        request.auth.token.email == 'sibinimigjc@gmail.com' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'agent' || 
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'))
+      );
+    }
+
+    // Super Contribuable (Banque/Supervisors)
+    function isSuper() {
+      return isSignedIn() && (
+        request.auth.token.email == 'sibinimigjc@gmail.com' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isSuperContribuable', false) == true)
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function hasPerm(permission) {
+      return isAdmin() || (isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+             permission in get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('permissions', []));
+    }
+
+    // ---------------------------------------------------------
+    // 2. VALIDATION BLUEPRINTS
+    // ---------------------------------------------------------
+
+    function isValidAppUser(data) {
+      return data.email is string 
+        && data.displayName is string && data.displayName.size() <= 128
+        && data.role in ['admin', 'agent', 'contributor']
+        && data.isActive is bool;
+    }
+
+    function isValidExchange(data) {
+      return data.senderId == request.auth.uid
+        && data.participants is list && data.participants.size() >= 2
+        && (data.body is string && data.body.size() <= 50000)
+        && data.createdAt == request.time;
+    }
+
+    function isValidInternalMsg(data) {
+      return data.senderId == request.auth.uid
+        && data.senderName is string
+        && data.channel in ['public', 'private']
+        && (data.text is string && data.text.size() <= 5000)
+        && (data.channel == 'public' || (data.participants is list && data.participants.size() >= 2))
+        && data.createdAt == request.time;
+    }
+
+    // ---------------------------------------------------------
+    // 3. COLLECTION RULES
+    // ---------------------------------------------------------
+
+    // User Management
+    match /users/{userId} {
+      allow get: if isSignedIn() && (userId == request.auth.uid || isAgent() || isSuper());
+      
+      allow list: if isSignedIn() && (
+        isAdmin() || 
+        isSuper() ||
+        (resource.data.email == request.auth.token.email) ||
+        (resource.data.role != 'contributor') || 
+        (resource.data.get('assignedAgentId', null) == null) || 
+        (resource.data.get('assignedAgentId', null) == request.auth.uid)
+      );
+
+      allow create: if isSignedIn() && (
+        (userId == request.auth.uid && isValidAppUser(incoming())) ||
+        isAdmin()
+      );
+
+      allow update: if isSignedIn() && (
+        (userId == request.auth.uid && (
+          // Self update of non-sensitive fields
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'displayName', 'photoURL', 'companyName', 'taxNumber', 'logoUrl', 
+            'companyPhotoUrl', 'address', 'isSetup', 'isActive', 'lastLogin', 
+            'updatedAt', 'internalPassword', 'phone', 'isNew', 'isFirstLogin', 'securityCode'
+          ])
+        )) ||
+        isAdmin() ||
+        hasPerm('agent_management') ||
+        request.auth.token.email == 'sibinimigjc@gmail.com'
+      );
+
+      allow delete: if isAdmin() || hasPerm('deletion');
+    }
+
+    // Conversations & Messages
+    match /conversations/{conversationId} {
+      allow get, list: if isSignedIn() && (isAgent() || request.auth.uid in resource.data.participants);
+      allow create: if isSignedIn();
+      allow update: if isSignedIn() && (isAgent() || request.auth.uid in resource.data.participants);
+      allow delete: if isAdmin() || hasPerm('deletion');
+
+      match /messages/{messageId} {
+        allow read: if isSignedIn() && (
+          isAgent() || 
+          (resource.data.participants).hasAny([request.auth.uid])
+        );
+        allow create: if isSignedIn() && (isAgent() || request.auth.uid in incoming().participants);
+        allow update, delete: if isAdmin() || hasPerm('deletion');
+      }
+    }
+
+    // Internal Collaboration (Staff Only)
+    match /canal_general_staff/{messageId} {
+      allow read, list: if isAgent();
+      allow create: if isAgent() && isValidInternalMsg(incoming()) && incoming().channel == 'public';
+      allow update, delete: if isAdmin() || (isAgent() && existing().senderId == request.auth.uid);
+    }
+
+    match /internal_messages/{messageId} {
+      allow get, list: if isAgent() && (isAdmin() || request.auth.uid in resource.data.participants);
+      allow create: if isAgent() && isValidInternalMsg(incoming()) && incoming().channel == 'private';
+      allow update, delete: if isAdmin() || (isAgent() && existing().senderId == request.auth.uid);
+    }
+
+    // Configuration & Branding
+    match /config/{configId} {
+      allow read: if true;
+      allow write: if isAdmin() || hasPerm('branding');
+    }
+
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if isAdmin() || hasPerm('branding');
+    }
+
+    // Invitations
+    match /invitations/{inviteId} {
+      allow get, list: if isSignedIn() && (isAgent() || resource.data.email == request.auth.token.email);
+      allow create: if isAdmin() || hasPerm('agent_management');
+      allow update: if isAdmin() || hasPerm('agent_management') || (
+        isSignedIn() && resource.data.email == request.auth.token.email && 
+        incoming().diff(existing()).affectedKeys().hasOnly(['status']) &&
+        incoming().status == 'accepted'
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /agents/{agentId} {
+      allow get, list: if isSignedIn() && (isAgent() || resource.data.email == request.auth.token.email);
+      allow write: if isAdmin() || hasPerm('agent_management');
+    }
+
+    match /contribuables/{taxpayerId} {
+      allow get, list: if isSignedIn() && (isAgent() || resource.data.email == request.auth.token.email);
+      allow write: if isAdmin() || hasPerm('agent_management');
+    }
+  }
+}

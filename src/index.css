@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
+:root {
+  --primary: #A93226;
+  --secondary: #F9EBEA;
+  --text-main: #2C3E50;
+  --text-muted: #7F8C8D;
+  --border-color: #E5E7EB;
+  --bg-main: #F4F7F6;
+  --radius: 16px;
+  --card-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1);
+  --comp-padding: 2.5rem;
+}
+
+@media (max-width: 768px) {
+  :root {
+    --comp-padding: 0.5rem;
+    --radius: 8px;
+  }
+  body {
+    font-size: 11px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  h1 {
+    font-size: 0.9rem !important;
+    letter-spacing: -0.02em !important;
+  }
+  h2 {
+    font-size: 0.85rem !important;
+  }
+  h3 {
+    font-size: 0.8rem !important;
+  }
+  .container {
+    padding-left: 4px !important;
+    padding-right: 4px !important;
+  }
+  button {
+    padding-top: 0.4rem !important;
+    padding-bottom: 0.4rem !important;
+    padding-left: 0.75rem !important;
+    padding-right: 0.75rem !important;
+    font-size: 0.6rem !important;
+    letter-spacing: 0.05em !important;
+  }
+  input, select, textarea {
+    font-size: 14px !important; /* Keep 14px for iOS zoom prevention */
+    padding: 0.5rem !important;
+  }
+  svg {
+    transform: scale(0.8);
+  }
+  .p-10 { padding: 0.75rem !important; }
+  .p-8 { padding: 0.5rem !important; }
+  .p-6 { padding: 0.4rem !important; }
+  .gap-6 { gap: 0.5rem !important; }
+  .rounded-[4rem] { rounded: 2rem !important; }
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: 'Inter', -apple-system, sans-serif;
+  background-color: var(--bg-main);
+  color: var(--text-main);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+.bg-primary {
+  background-color: var(--primary);
+}
+
+.text-primary {
+  color: var(--primary);
+}
+
+.border-primary {
+  border-color: var(--primary);
+}
+
+@theme {
+  --color-primary: var(--primary);
+  --color-secondary: var(--secondary);
+  --color-border-custom: var(--border-color);
+  --color-text-main: var(--text-main);
+  --color-text-muted: var(--text-muted);
+}

@@ -156,7 +156,8 @@ import {
   AlertCircle,
   Phone,
   UserMinus,
-  FileStack
+  FileStack,
+  Key
 } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -383,11 +384,20 @@ function updateFavicon(url: string) {
 
 const ThemeProvider = ({ children }: { children: React.ReactNode }) => {
   const [theme, setTheme] = useState<ThemeConfig>(() => {
-    const saved = localStorage.getItem('dgi_theme');
+    // Étape 1 : Au démarrage de l'application, vérification du stockage local
+    const savedBranding = localStorage.getItem('dgi_branding');
+    const savedTheme = localStorage.getItem('dgi_theme');
+    
     let baseTheme = DEFAULT_THEME;
-    if (saved) {
+    if (savedBranding) {
         try {
-            baseTheme = { ...DEFAULT_THEME, ...JSON.parse(saved) };
+            baseTheme = { ...DEFAULT_THEME, ...JSON.parse(savedBranding) };
+        } catch (e) {
+            // fallback if failed to parse
+        }
+    } else if (savedTheme) {
+        try {
+            baseTheme = { ...DEFAULT_THEME, ...JSON.parse(savedTheme) };
         } catch(e) {
             baseTheme = DEFAULT_THEME;
         }
@@ -420,9 +430,14 @@ const ThemeProvider = ({ children }: { children: React.ReactNode }) => {
   });
 
   useEffect(() => {
+    // Étape 2 : Lancement de l'écouteur Firestore en parallèle
     const unsub = onSnapshot(doc(db, 'settings', 'branding'), (snap) => {
       if (snap.exists()) {
         const data = snap.data() as ThemeConfig;
+        
+        // Sauvegarde immédiate dans le stockage local pour persistance
+        localStorage.setItem('dgi_branding', JSON.stringify(data));
+        
         setTheme(prev => {
           if (data.updatedAt && prev.updatedAt && data.updatedAt < prev.updatedAt) {
             return prev;
@@ -612,13 +627,25 @@ const AuthProvider = ({ children }: { children: React.ReactNode }) => {
               
               // Internal Password Flow for Agents
               if (hasProfessionalRole) {
-                  // Re-check isNew status from DB
-                  if (userData.isNew) {
-                      setIsFirstSetup(true);
-                      setInternalAuthPending(true);
-                  } else if (!isAdminAuthenticated) {
-                      setInternalAuthPending(true);
+                  const isSuperAdmin = fbUser.email === 'sibinimigjc@gmail.com';
+                  if (!isSuperAdmin) {
+                      // Supprime complètement la demande de mot de passe pour tous les agents ordinaires
+                      setAdminAuthenticated(true);
+                      setIsFirstSetup(false);
+                      setInternalAuthPending(false);
+                  } else {
+                      // Le Super-Admin unique requiert toujours le code maître de sécurité maximal
+                      if (!isAdminAuthenticated) {
+                          setIsFirstSetup(false);
+                          setInternalAuthPending(true);
+                      } else {
+                          setIsFirstSetup(false);
+                          setInternalAuthPending(false);
+                      }
                   }
+              } else {
+                  setIsFirstSetup(false);
+                  setInternalAuthPending(false);
               }
 
               setUser(userData);
@@ -650,22 +677,52 @@ const AuthProvider = ({ children }: { children: React.ReactNode }) => {
                 }
               }
 
+              // If it's a taxpayer, look up any pending registration info in localStorage
+              let taxNumber = '';
+              let companyName = '';
+              if (!hasProfessionalRole) {
+                const pendingJson = localStorage.getItem('pending_taxpayer_reg');
+                if (pendingJson) {
+                  try {
+                    const parsed = JSON.parse(pendingJson);
+                    taxNumber = parsed.taxNumber || '';
+                    companyName = parsed.companyName || '';
+                    localStorage.removeItem('pending_taxpayer_reg');
+                  } catch (e) {
+                    console.error("Failed to parse pending taxpayer reg", e);
+                  }
+                }
+              }
+
               const newUser: AppUser = {
                 uid: fbUser.uid,
                 email: fbUser.email || '',
-                role: existingData?.role || initialRole,
-                displayName: fbUser.displayName || existingData?.displayName || fbUser.displayName || 'Utilisateur',
+                role: existingData?.role || (hasProfessionalRole ? initialRole : 'contributor'),
+                displayName: companyName || fbUser.displayName || existingData?.displayName || fbUser.displayName || 'Utilisateur',
                 photoURL: fbUser.photoURL || '',
-                isSetup: true,
+                isSetup: hasProfessionalRole ? true : !!taxNumber,
                 isActive: true,
-                isNew: existingData ? (existingData.isNew !== false) : hasProfessionalRole, // Professional profiles start as "New" for internal pass
+                isNew: hasProfessionalRole ? (existingData ? (existingData.isNew !== false) : true) : false, // Taxpayers never have the "isNew" password setup flag
                 lastLogin: serverTimestamp(),
                 internalPassword: existingData?.internalPassword || null,
                 phone: existingData?.phone || null,
                 address: existingData?.address || null,
-                permissions: existingData?.permissions || []
+                permissions: existingData?.permissions || [],
+                taxNumber: taxNumber || null,
+                companyName: companyName || null
               };
               await setDoc(docRef, newUser);
+
+              // If registering as a taxpayer, also populate the contribuables collection
+              if (!hasProfessionalRole && taxNumber) {
+                await setDoc(doc(db, 'contribuables', fbUser.uid), {
+                  uid: fbUser.uid,
+                  email: fbUser.email,
+                  taxNumber: taxNumber,
+                  companyName: companyName,
+                  role: 'contributor'
+                });
+              }
             }
           });
 
@@ -764,7 +821,7 @@ const useTheme = () => {
 
 const hasPermission = (user: AppUser | null, permission: AgentPermission) => {
     if (!user) return false;
-    if (user.email === 'sibinimigjc@gmail.com') return true;
+    if (user.email === 'sibinimigjc@gmail.com' || user.role === 'admin') return true;
     return user.permissions?.includes(permission);
 };
 
@@ -799,6 +856,7 @@ const AppShell = ({ children }: { children: React.ReactNode }) => {
   const [isReauthOpen, setIsReauthOpen] = useState(false);
   
   // Internal Pass states
+  const [tempStartPass, setTempStartPass] = useState('');
   const [internalPass, setInternalPass] = useState('');
   const [internalPassConfirm, setInternalPassConfirm] = useState('');
   const [internalError, setInternalError] = useState('');
@@ -842,12 +900,20 @@ const AppShell = ({ children }: { children: React.ReactNode }) => {
 
   const handleInternalAuth = async () => {
     if (isFirstSetup) {
+      if (!tempStartPass) {
+        setInternalError('Le mot de passe de départ (fourni par l\'administrateur) est requis');
+        return;
+      }
+      if (tempStartPass !== user?.internalPassword) {
+        setInternalError('Le mot de passe de départ est incorrect');
+        return;
+      }
       if (internalPass.length < 6) {
-        setInternalError('Le mot de passe doit faire au moins 6 caractères');
+        setInternalError('Le nouveau mot de passe doit faire au moins 6 caractères');
         return;
       }
       if (internalPass !== internalPassConfirm) {
-        setInternalError('Les mots de passe ne correspondent pas');
+        setInternalError('Les nouveaux mots de passe ne correspondent pas');
         return;
       }
       // Save password
@@ -856,25 +922,51 @@ const AppShell = ({ children }: { children: React.ReactNode }) => {
           internalPassword: internalPass,
           isNew: false
         });
+        await updateDoc(doc(db, 'agents', user!.uid), {
+          password: internalPass,
+          isNew: false
+        });
         setAdminAuthenticated(true);
         setInternalAuthPending(false);
         setIsFirstSetup(false);
+        setTempStartPass('');
         setInternalPass('');
         setInternalPassConfirm('');
+        // Forcer la vue Gestionnaire (Agent) et rediriger
+        setUserViewMode(false);
+        setAdminMode(true);
+        navigate('/admin');
       } catch (e) {
         setInternalError('Erreur lors de l\'enregistrement');
       }
     } else {
-      if (internalPass === user?.internalPassword || isMasterCodeValid(internalPass)) {
+      const emailIsSibi = user?.email === 'sibinimigjc@gmail.com';
+      const isPasswordValid = emailIsSibi 
+        ? isMasterCodeValid(internalPass)
+        : (internalPass === user?.internalPassword);
+
+      if (isPasswordValid) {
         setAdminAuthenticated(true);
         setInternalAuthPending(false);
         setInternalPass('');
         setInternalError('');
+        // Forcer la vue Gestionnaire (Agent) et rediriger
+        setUserViewMode(false);
+        setAdminMode(true);
+        navigate('/admin');
       } else {
         setInternalError('Mot de passe interne incorrect');
       }
     }
   };
+
+  useEffect(() => {
+    if (user && (user.role === 'admin' || user.role === 'agent') && isAdminAuthenticated && !userViewMode) {
+      if (location.pathname === '/' || location.pathname === '/login') {
+        navigate('/admin');
+      }
+    }
+  }, [user, isAdminAuthenticated, userViewMode, location.pathname, navigate]);
 
   const switchRole = async (role: UserRole) => {
     setActiveRole(role);
@@ -937,6 +1029,18 @@ const AppShell = ({ children }: { children: React.ReactNode }) => {
             <span className="sm:hidden">{userViewMode ? "Sortir" : "Admin"}</span>
           </button>
         )}
+
+        {availableRoles.includes('contributor') && (availableRoles.includes('agent') || availableRoles.includes('admin')) && (
+          <button 
+            onClick={() => switchRole(activeRole === 'contributor' ? (availableRoles.find(r => r !== 'contributor') || 'agent') : 'contributor')}
+            className="text-[8px] md:text-[10px] font-black uppercase tracking-[0.2em] px-2 md:px-4 py-2.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg md:rounded-xl transition-all shadow-lg flex items-center gap-2 group whitespace-nowrap border border-amber-500"
+          >
+            <ArrowRightLeft size={12} className="group-hover:rotate-180 transition-transform duration-500 text-amber-100" />
+            <span>
+              {activeRole === 'contributor' ? 'Basculer vers mon espace Agent' : 'Basculer vers mon espace Contribuable'}
+            </span>
+          </button>
+        )}
         <div className="flex items-center gap-2 md:gap-4 border-l border-white/20 pl-3 md:pl-6 h-10">
           <div className="text-right hidden sm:block">
             <p className="text-xs md:text-sm font-black tracking-tight leading-none mb-1 truncate max-w-[120px]">{user?.displayName}</p>
@@ -977,13 +1081,27 @@ const AppShell = ({ children }: { children: React.ReactNode }) => {
                 </p>
 
                 <div className="space-y-6">
+                    {isFirstSetup && (
+                        <div className="relative group">
+                            <Key className="absolute left-6 top-1/2 -translate-y-1/2 text-gray-300 group-focus-within:text-primary transition-colors" size={20} />
+                            <input 
+                                type="password"
+                                autoFocus
+                                placeholder="Mot de Passe de Départ"
+                                className="w-full pl-16 pr-6 py-5 bg-amber-50/20 border border-amber-100 rounded-2xl outline-none focus:ring-4 focus:ring-primary/5 text-center text-xl tracking-[0.3em] font-black transition-all shadow-inner placeholder:text-gray-400 placeholder:tracking-normal placeholder:font-medium text-amber-700"
+                                value={tempStartPass}
+                                onChange={e => setTempStartPass(e.target.value)}
+                            />
+                        </div>
+                    )}
+
                     <div className="relative group">
                         <Lock className="absolute left-6 top-1/2 -translate-y-1/2 text-gray-300 group-focus-within:text-primary transition-colors" size={20} />
                         <input 
                             type="password"
-                            autoFocus
+                            autoFocus={!isFirstSetup}
                             placeholder={isFirstSetup ? "Nouveau Mot de Passe" : "Mot de Passe Interne"}
-                            className="w-full pl-16 pr-6 py-5 bg-gray-50 border border-gray-100 rounded-2xl outline-none focus:ring-4 focus:ring-primary/5 text-center text-xl tracking-[0.3em] font-black transition-all shadow-inner"
+                            className="w-full pl-16 pr-6 py-5 bg-gray-50 border border-gray-100 rounded-2xl outline-none focus:ring-4 focus:ring-primary/5 text-center text-xl tracking-[0.3em] font-black transition-all shadow-inner placeholder:text-gray-400 placeholder:tracking-normal placeholder:font-medium"
                             value={internalPass}
                             onChange={e => setInternalPass(e.target.value)}
                             onKeyDown={e => e.key === 'Enter' && (!isFirstSetup && handleInternalAuth())}
@@ -995,8 +1113,8 @@ const AppShell = ({ children }: { children: React.ReactNode }) => {
                              <ShieldCheck className="absolute left-6 top-1/2 -translate-y-1/2 text-gray-300 group-focus-within:text-primary transition-colors" size={20} />
                              <input 
                                 type="password"
-                                placeholder="Confirmer"
-                                className="w-full pl-16 pr-6 py-5 bg-gray-50 border border-gray-100 rounded-2xl outline-none focus:ring-4 focus:ring-primary/5 text-center text-xl tracking-[0.3em] font-black transition-all shadow-inner"
+                                placeholder="Confirmer le Nouveau MDP"
+                                className="w-full pl-16 pr-6 py-5 bg-gray-50 border border-gray-100 rounded-2xl outline-none focus:ring-4 focus:ring-primary/5 text-center text-xl tracking-[0.3em] font-black transition-all shadow-inner placeholder:text-gray-400 placeholder:tracking-normal placeholder:font-medium"
                                 value={internalPassConfirm}
                                 onChange={e => setInternalPassConfirm(e.target.value)}
                                 onKeyDown={e => e.key === 'Enter' && handleInternalAuth()}
@@ -1241,17 +1359,34 @@ const DashboardPage = () => {
     useEffect(() => {
         if (!user) return;
         
-        const qConv = (user.role === 'admin' && !userViewMode)
-            ? query(collection(db, 'conversations'), orderBy('lastUpdate', 'desc'), limit(10))
-            : query(
+        const isSuperAdmin = user.email === 'sibinimigjc@gmail.com';
+        let qConv;
+        if (isSuperAdmin) {
+            qConv = query(collection(db, 'conversations'), orderBy('lastUpdate', 'desc'), limit(10));
+        } else if (user.role === 'agent' || user.role === 'admin') {
+            qConv = query(
+                collection(db, 'conversations'),
+                where('assignedAgentId', '==', user.uid)
+            );
+        } else {
+            qConv = query(
                 collection(db, 'conversations'), 
                 where('participants', 'array-contains', user.uid),
                 orderBy('lastUpdate', 'desc'), 
                 limit(10)
             );
+        }
 
         const unsubConv = onSnapshot(qConv, (snap) => {
-            const all = snap.docs.map(d => ({ id: d.id, ...d.data() } as Conversation));
+            let all = snap.docs.map(d => ({ id: d.id, ...d.data() } as Conversation));
+            if (!isSuperAdmin && (user.role === 'agent' || user.role === 'admin')) {
+                all.sort((a, b) => {
+                    const tA = a.lastUpdate?.toMillis ? a.lastUpdate.toMillis() : (a.lastUpdate?.seconds ? a.lastUpdate.seconds * 1000 : 0);
+                    const tB = b.lastUpdate?.toMillis ? b.lastUpdate.toMillis() : (b.lastUpdate?.seconds ? b.lastUpdate.seconds * 1000 : 0);
+                    return tB - tA;
+                });
+                all = all.slice(0, 10);
+            }
             setStats(prev => ({ ...prev, messages: all.length }));
             setRecent(all);
         }, err => handleFirestoreError(err, OperationType.LIST, 'conversations'));
@@ -1460,9 +1595,15 @@ const MessagingPage = () => {
     useEffect(() => {
         if (!user) return;
         
+        const isSuperAdmin = user.email === 'sibinimigjc@gmail.com';
         let q;
-        if (user.role === 'admin' || user.role === 'agent') {
+        if (isSuperAdmin) {
             q = query(collection(db, 'conversations'), orderBy('lastUpdate', 'desc'));
+        } else if (user.role === 'admin' || user.role === 'agent') {
+            q = query(
+                collection(db, 'conversations'),
+                where('assignedAgentId', '==', user.uid)
+            );
         } else {
             q = query(
                 collection(db, 'conversations'), 
@@ -1472,11 +1613,21 @@ const MessagingPage = () => {
         }
         
         const unsub = onSnapshot(q, 
-            (snap) => setConversations(snap.docs.map(d => ({ id: d.id, ...d.data() } as Conversation))),
+            (snap) => {
+                let list = snap.docs.map(d => ({ id: d.id, ...d.data() } as Conversation));
+                if (!isSuperAdmin && (user.role === 'admin' || user.role === 'agent')) {
+                    list.sort((a, b) => {
+                        const tA = a.lastUpdate?.toMillis ? a.lastUpdate.toMillis() : (a.lastUpdate?.seconds ? a.lastUpdate.seconds * 1000 : 0);
+                        const tB = b.lastUpdate?.toMillis ? b.lastUpdate.toMillis() : (b.lastUpdate?.seconds ? b.lastUpdate.seconds * 1000 : 0);
+                        return tB - tA;
+                    });
+                }
+                setConversations(list);
+            },
             (err) => handleFirestoreError(err, OperationType.LIST, 'conversations')
         );
         return () => unsub();
-    }, [user?.uid, user?.role]);
+    }, [user?.uid, user?.role, user?.email]);
 
     useEffect(() => {
         if (!selectedConv) {
@@ -1513,7 +1664,7 @@ const MessagingPage = () => {
                 collection(db, 'users'), 
                 and(
                     where('role', '==', 'contributor'),
-                    or(where('assignedAgentId', '==', null), where('assignedAgentId', '==', user.uid))
+                    where('assignedAgentId', '==', user.uid)
                 )
             );
             
@@ -1592,10 +1743,27 @@ const MessagingPage = () => {
             }
 
             if (!conversationId) {
+                let finalAssignedAgentId = 'global';
+                let finalAssignedAgentEmail = 'global';
+                let finalAssignedAgentName = 'Staff';
+
+                if (user.role !== 'contributor') {
+                    finalAssignedAgentId = user.uid;
+                    finalAssignedAgentEmail = user.email || '';
+                    finalAssignedAgentName = user.displayName || user.email || 'Staff';
+                } else if (targetTaxpayer) {
+                    finalAssignedAgentId = targetTaxpayer.assignedAgentId || 'global';
+                    finalAssignedAgentEmail = (targetTaxpayer as any).assignedAgentEmail || 'global';
+                    finalAssignedAgentName = targetTaxpayer.assignedAgentName || 'Staff';
+                }
+
                 const convRef = await addDoc(collection(db, 'conversations'), {
                     participants: currentParticipants,
                     contributorId,
                     agentId: user.role !== 'contributor' ? user.uid : 'global',
+                    assignedAgentId: finalAssignedAgentId,
+                    assignedAgentEmail: finalAssignedAgentEmail,
+                    assignedAgentName: finalAssignedAgentName,
                     subject: finalSubject,
                     lastUpdate: serverTimestamp(),
                     lastMessagePreview: finalBody.substring(0, 100),
@@ -1696,8 +1864,15 @@ const MessagingPage = () => {
 
     const handleTransfer = async (agentUid: string) => {
         if (!selectedConv) return;
+        const targetAgentObj = agents.find(a => a.uid === agentUid);
+        const agentEmail = targetAgentObj?.email || '';
+        const agentName = targetAgentObj?.displayName || '';
+
         await updateDoc(doc(db, 'conversations', selectedConv.id), {
             agentId: agentUid,
+            assignedAgentId: agentUid,
+            assignedAgentEmail: agentEmail,
+            assignedAgentName: agentName,
             participants: [selectedConv.contributorId, agentUid]
         });
         setIsTransferOpen(false);
@@ -2431,6 +2606,7 @@ const SettingsPage = () => {
         lastName: '',
         email: '',
         phone: '',
+        tempPassword: 'Dgi2026!',
         role: 'agent' as UserRole,
         permissions: [] as AgentPermission[]
     });
@@ -2476,7 +2652,7 @@ const SettingsPage = () => {
         if (!agentForm.email.trim() || !user) return;
         setLoading(true);
         try {
-            const tempPass = Math.random().toString(36).slice(-8).toUpperCase();
+            const tempPass = agentForm.tempPassword || 'Dgi2026!';
             const displayName = `${agentForm.firstName} ${agentForm.lastName}`.trim();
             
             const newUser: Partial<AppUser> = {
@@ -2490,7 +2666,7 @@ const SettingsPage = () => {
                 isNew: true, // Requested field
                 isSetup: true,
                 assignedContribuables: [], // Requested field
-                tempPassword: tempPass,
+                internalPassword: tempPass,
                 lastLogin: null
             };
 
@@ -2501,11 +2677,13 @@ const SettingsPage = () => {
                 email: newUser.email,
                 role: newUser.role,
                 displayName: newUser.displayName,
-                uid: agentRef.id
+                uid: agentRef.id,
+                password: tempPass,
+                isNew: true
             });
             
-            setAgentForm({ firstName: '', lastName: '', email: '', phone: '', role: 'agent', permissions: [] });
-            setStatus(`Profil Agent créé : ${agentForm.email}. Code d'activation généré.`);
+            setAgentForm({ firstName: '', lastName: '', email: '', phone: '', tempPassword: 'Dgi2026!', role: 'agent', permissions: [] });
+            setStatus(`Profil Agent créé : ${agentForm.email}. Code d'activation temporaire: ${tempPass}.`);
         } catch (e) {
             console.error(e);
             setStatus("Erreur lors de la création");
@@ -2516,10 +2694,56 @@ const SettingsPage = () => {
     };
 
     const [editingAgent, setEditingAgent] = useState<AppUser | null>(null);
+    const [editAgentPassword, setEditAgentPassword] = useState('');
+    const [editAgentIsNew, setEditAgentIsNew] = useState(false);
     const [viewingAgentProfile, setViewingAgentProfile] = useState<AppUser | null>(null);
     const [attributingAgent, setAttributingAgent] = useState<AppUser | null>(null);
     const [allTaxpayers, setAllTaxpayers] = useState<AppUser[]>([]);
     const [taxpayerSearch, setTaxpayerSearch] = useState('');
+
+    const openEditAgent = async (agent: AppUser) => {
+        setLoading(true);
+        try {
+            const agentsRef = collection(db, 'agents');
+            const agentSnap = await getDocs(query(agentsRef, where('email', '==', agent.email.toLowerCase().trim())));
+            let password = '';
+            let isNew = true;
+            let permissions: AgentPermission[] = agent.permissions || [];
+            
+            if (!agentSnap.empty) {
+                const data = agentSnap.docs[0].data();
+                password = data.password || '';
+                isNew = data.isNew !== false;
+                if (data.permissions) {
+                    permissions = data.permissions;
+                }
+            } else {
+                password = agent.internalPassword || 'Dgi2026!';
+                isNew = agent.isNew !== false;
+            }
+
+            setEditingAgent({
+                ...agent,
+                permissions,
+                internalPassword: password,
+                isNew: isNew
+            });
+            setEditAgentPassword(password);
+            setEditAgentIsNew(isNew);
+        } catch (e) {
+            console.error("Error opening edit agent info:", e);
+            setEditingAgent({
+                ...agent,
+                permissions: agent.permissions || [],
+                internalPassword: agent.internalPassword || 'Dgi2026!',
+                isNew: agent.isNew !== false
+            });
+            setEditAgentPassword(agent.internalPassword || 'Dgi2026!');
+            setEditAgentIsNew(agent.isNew !== false);
+        } finally {
+            setLoading(false);
+        }
+    };
 
     useEffect(() => {
         if (attributingAgent && user) {
@@ -2546,8 +2770,24 @@ const SettingsPage = () => {
             await updateDoc(doc(db, 'users', taxpayer.uid), {
                 assignedAgentId: attributingAgent.uid,
                 assignedAgentName: attributingAgent.displayName,
+                assignedAgentEmail: attributingAgent.email,
                 updatedAt: serverTimestamp()
             });
+
+            // Retroactively assign existing conversations to the agent too
+            const convsSnap = await getDocs(query(
+                collection(db, 'conversations'), 
+                where('contributorId', '==', taxpayer.uid)
+            ));
+            for (const convDoc of convsSnap.docs) {
+                await updateDoc(convDoc.ref, {
+                    agentId: attributingAgent.uid,
+                    assignedAgentId: attributingAgent.uid,
+                    assignedAgentEmail: attributingAgent.email,
+                    assignedAgentName: attributingAgent.displayName
+                });
+            }
+
             setStatus(`${taxpayer.companyName} attribué à ${attributingAgent.displayName}`);
         } catch (e) {
             console.error(e);
@@ -2557,17 +2797,52 @@ const SettingsPage = () => {
     const handleUpdateAgentRole = async () => {
         if (!editingAgent) return;
         setLoading(true);
+        setStatus("Mise à jour en cours...");
         try {
-            await updateDoc(doc(db, 'users', editingAgent.uid), {
+            const isPasswordChanged = editAgentPassword !== editingAgent.internalPassword;
+            const finalIsNew = isPasswordChanged ? true : editAgentIsNew;
+
+            const userDocRef = doc(db, 'users', editingAgent.uid);
+            await updateDoc(userDocRef, {
                 role: editingAgent.role,
-                isActive: editingAgent.isActive
+                permissions: editingAgent.permissions || [],
+                internalPassword: editAgentPassword,
+                isNew: finalIsNew,
+                isActive: editingAgent.isActive !== false
             });
+
+            const agentsRef = collection(db, 'agents');
+            const agentSnap = await getDocs(query(agentsRef, where('email', '==', editingAgent.email.toLowerCase().trim())));
+            
+            if (!agentSnap.empty) {
+                const matchedAgentDocRef = agentSnap.docs[0].ref;
+                await updateDoc(matchedAgentDocRef, {
+                    role: editingAgent.role,
+                    permissions: editingAgent.permissions || [],
+                    password: editAgentPassword,
+                    isNew: finalIsNew,
+                    displayName: editingAgent.displayName
+                });
+            } else {
+                await setDoc(doc(db, 'agents', editingAgent.uid), {
+                    email: editingAgent.email.toLowerCase().trim(),
+                    role: editingAgent.role,
+                    displayName: editingAgent.displayName,
+                    uid: editingAgent.uid,
+                    password: editAgentPassword,
+                    isNew: finalIsNew,
+                    permissions: editingAgent.permissions || []
+                });
+            }
+
             setEditingAgent(null);
-            setStatus("Agent mis à jour");
+            setStatus("Profil Agent mis à jour avec succès dans l'infrastructure de la DGI !");
         } catch (e) {
             console.error(e);
+            setStatus("Erreur lors de la mise à jour");
         } finally {
             setLoading(false);
+            setTimeout(() => setStatus(''), 4000);
         }
     };
 
@@ -2585,12 +2860,16 @@ const SettingsPage = () => {
     };
 
     const resetAgentPassword = async (agent: AppUser) => {
-        const newTempPass = Math.random().toString(36).slice(-8).toUpperCase();
+        const newTempPass = 'Dgi' + Math.random().toString(36).slice(-4).toUpperCase() + '!';
         await updateDoc(doc(db, 'users', agent.uid), {
-            tempPassword: newTempPass,
-            isSetup: false
+            internalPassword: newTempPass,
+            isNew: true
         });
-        setStatus(`Mot de passe réinitialisé pour ${agent.displayName}. Nouveau code: ${newTempPass}`);
+        await updateDoc(doc(db, 'agents', agent.uid), {
+            password: newTempPass,
+            isNew: true
+        });
+        setStatus(`Mot de passe réinitialisé pour ${agent.displayName}. Nouveau code temporaire: ${newTempPass}`);
     };
 
     const resetVisuals = async () => {
@@ -2948,7 +3227,16 @@ const SettingsPage = () => {
                                             onChange={e => setAgentForm(p => ({ ...p, phone: e.target.value }))}
                                         />
                                     </div>
-                                    <div className="space-y-2 lg:col-span-2">
+                                    <div className="space-y-2">
+                                        <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest pl-1">Mot de Passe de Départ (Clé Initiale)</label>
+                                        <input 
+                                            placeholder="Ex: Dgi2026!" 
+                                            className="w-full px-6 py-4 bg-white border border-gray-200 rounded-2xl text-sm font-black outline-none focus:ring-4 focus:ring-primary/5 transition-all shadow-sm text-amber-700 bg-amber-50/20"
+                                            value={agentForm.tempPassword}
+                                            onChange={e => setAgentForm(p => ({ ...p, tempPassword: e.target.value }))}
+                                        />
+                                    </div>
+                                    <div className="space-y-2 lg:col-span-1">
                                         <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest pl-1">Périmètre de Responsabilité</label>
                                         <div className="flex gap-4">
                                             <button 
@@ -3035,12 +3323,16 @@ const SettingsPage = () => {
                                                     !agent.isActive && "opacity-50"
                                                 )}
                                             >
-                                                <div className="col-span-5 flex items-center gap-4">
-                                                    <div className="w-10 h-10 rounded-xl bg-primary/5 text-primary flex items-center justify-center font-black uppercase shadow-sm border border-primary/10">
+                                                <div 
+                                                    onClick={() => openEditAgent(agent)}
+                                                    className="col-span-5 flex items-center gap-4 cursor-pointer hover:opacity-80 group/row transition-all"
+                                                    title="Modifier les habilitations de l'agent"
+                                                >
+                                                    <div className="w-10 h-10 rounded-xl bg-primary/5 text-primary flex items-center justify-center font-black uppercase shadow-sm border border-primary/10 group-hover/row:scale-110 transition-transform">
                                                         {agent.displayName[0]}
                                                     </div>
                                                     <div className="min-w-0">
-                                                        <p className="text-sm font-black text-[#2C3E50] truncate">{agent.displayName}</p>
+                                                        <p className="text-sm font-black text-[#2C3E50] truncate group-hover/row:text-primary transition-colors">{agent.displayName}</p>
                                                         <p className="text-[10px] text-gray-400 font-medium truncate italic">{agent.email}</p>
                                                     </div>
                                                 </div>
@@ -3066,11 +3358,12 @@ const SettingsPage = () => {
                                                         Gérer le profil
                                                     </button>
                                                     <button 
-                                                        onClick={() => setEditingAgent(agent)}
-                                                        className="p-2 text-gray-400 hover:text-primary transition-colors"
-                                                        title="Paramètres d'accès"
+                                                        onClick={() => openEditAgent(agent)}
+                                                        className="px-4 py-2 bg-primary/10 border border-primary/20 text-primary rounded-lg text-[9px] font-black uppercase tracking-widest hover:bg-primary hover:text-white hover:border-primary transition-all shadow-sm flex items-center gap-1"
+                                                        title="Paramètres d'accès & Habilitations"
                                                     >
-                                                        <Settings size={16} />
+                                                        <Settings size={12} />
+                                                        <span>Modifier</span>
                                                     </button>
                                                 </div>
                                             </div>
@@ -3122,24 +3415,130 @@ const SettingsPage = () => {
                 {/* Edit Agent Modal */}
                 {editingAgent && (
                     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-gray-900/60 backdrop-blur-md p-4 animate-in fade-in duration-300">
-                        <div className="bg-white p-8 md:p-12 rounded-[3.5rem] shadow-2xl max-w-md w-full border border-white animate-in zoom-in duration-300">
-                            <div className="w-20 h-20 bg-primary/10 text-primary rounded-[1.5rem] flex items-center justify-center mx-auto mb-8 shadow-inner">
+                        <div className="bg-white p-8 md:p-10 rounded-[3.5rem] shadow-2xl max-w-xl w-full border border-white animate-in zoom-in duration-300 max-h-[90vh] overflow-y-auto custom-scrollbar relative">
+                            <button 
+                                onClick={() => setEditingAgent(null)}
+                                className="absolute top-6 right-6 p-2 bg-gray-50 rounded-xl hover:text-red-500 transition-colors"
+                            >
+                                <X size={20} />
+                            </button>
+                            <div className="w-16 h-16 bg-primary/10 text-primary rounded-[1.5rem] flex items-center justify-center mx-auto mb-6 shadow-inner">
                                 <Settings size={40} />
                             </div>
-                            <h2 className="text-2xl font-black text-[#2C3E50] text-center mb-2 italic">Habilitation</h2>
+                            <h2 className="text-2xl font-black text-[#2C3E50] text-[#2C3E50] text-center mb-1 italic uppercase tracking-tight">Habilitation & Droits</h2>
                             <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest text-center mb-10">{editingAgent.email}</p>
 
                             <div className="space-y-6">
-                                <div className="space-y-2">
-                                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest pl-2">Rôle Certifié</label>
-                                    <select 
-                                        className="w-full px-6 py-4 bg-gray-50 border border-gray-100 rounded-2xl text-sm font-black outline-none"
-                                        value={editingAgent.role}
-                                        onChange={e => setEditingAgent({ ...editingAgent, role: e.target.value as any })}
-                                    >
-                                        <option value="agent">Agent Régulier</option>
-                                        <option value="admin">Administrateur Senior</option>
-                                    </select>
+                                {/* Périmètre de responsabilité */}
+                                <div className="space-y-3">
+                                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Périmètre de Responsabilité</label>
+                                    <div className="flex gap-4">
+                                        <button 
+                                            type="button"
+                                            onClick={() => setEditingAgent(p => p ? { ...p, role: 'agent' } : null)}
+                                            className={cn(
+                                                "flex-1 py-4 rounded-xl border-2 font-black text-[10px] uppercase tracking-widest transition-all", 
+                                                editingAgent.role === 'agent' 
+                                                    ? "bg-primary text-white border-primary shadow-lg shadow-primary/20" 
+                                                    : "bg-white text-gray-400 border-gray-100 hover:border-gray-200"
+                                            )}
+                                        >
+                                            Gestionnaire Dossiers
+                                        </button>
+                                        <button 
+                                            type="button"
+                                            onClick={() => setEditingAgent(p => p ? { ...p, role: 'admin' } : null)}
+                                            className={cn(
+                                                "flex-1 py-4 rounded-xl border-2 font-black text-[10px] uppercase tracking-widest transition-all", 
+                                                editingAgent.role === 'admin' 
+                                                    ? "bg-primary text-white border-primary shadow-lg shadow-primary/20" 
+                                                    : "bg-white text-gray-400 border-gray-100 hover:border-gray-200"
+                                            )}
+                                        >
+                                            Superviseur Admin
+                                        </button>
+                                    </div>
+                                </div>
+
+                                {/* Droits d'accès granulaires */}
+                                <div className="space-y-3">
+                                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Droits d'accès granulaires (Permissions)</label>
+                                    <div className="grid grid-cols-2 gap-3">
+                                        {[
+                                            { id: 'branding', label: 'Branding', icon: Settings },
+                                            { id: 'agent_management', label: 'Gestion Agents', icon: Users },
+                                            { id: 'deletion', label: 'Suppression', icon: Trash2 },
+                                            { id: 'tax_consultation', label: 'Consultation NIU', icon: ShieldCheck }
+                                        ].map(p => {
+                                            const hasPerm = editingAgent.permissions?.includes(p.id as AgentPermission);
+                                            return (
+                                                <button 
+                                                    type="button"
+                                                    key={p.id}
+                                                    onClick={() => {
+                                                        const perm = p.id as AgentPermission;
+                                                        const currentPerms = editingAgent.permissions || [];
+                                                        setEditingAgent(prev => {
+                                                            if (!prev) return null;
+                                                            return {
+                                                                ...prev,
+                                                                permissions: currentPerms.includes(perm)
+                                                                    ? currentPerms.filter(x => x !== perm)
+                                                                    : [...currentPerms, perm]
+                                                            };
+                                                        });
+                                                    }}
+                                                    className={cn(
+                                                        "p-4 rounded-2xl border-2 flex flex-col items-center gap-2 transition-all",
+                                                        hasPerm ? "bg-primary/5 border-primary text-primary" : "bg-white border-gray-100 text-gray-400 hover:border-gray-200"
+                                                    )}
+                                                >
+                                                    <p.icon size={18} />
+                                                    <span className="text-[8px] font-black uppercase tracking-widest">{p.label}</span>
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+
+                                {/* Mot de Passe de l'Agent */}
+                                <div className="space-y-2 p-5 bg-amber-50/20 border border-amber-100 rounded-3xl">
+                                    <div className="flex items-center justify-between">
+                                        <label className="text-[10px] font-black text-amber-800 uppercase tracking-widest">Mot de Passe Interne / Départ</label>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                const generated = 'Dgi' + Math.random().toString(36).slice(-4).toUpperCase() + '!';
+                                                setEditAgentPassword(generated);
+                                                setEditAgentIsNew(true);
+                                            }}
+                                            className="text-[9px] font-black uppercase tracking-widest text-primary hover:underline hover:text-primary/80 transition-all"
+                                        >
+                                            Générer un code
+                                        </button>
+                                    </div>
+                                    <input 
+                                        type="text"
+                                        placeholder="Mot de passe" 
+                                        className="w-full px-6 py-4 bg-white border border-gray-200 rounded-2xl text-sm font-black outline-none focus:ring-4 focus:ring-primary/5 transition-all shadow-sm text-center tracking-wider text-amber-700 font-mono"
+                                        value={editAgentPassword}
+                                        onChange={e => {
+                                            setEditAgentPassword(e.target.value);
+                                            setEditAgentIsNew(true);
+                                        }}
+                                    />
+                                    <div className="flex items-center gap-2 pt-2">
+                                        <input 
+                                            type="checkbox"
+                                            id="force-password-change"
+                                            checked={editAgentIsNew}
+                                            onChange={e => setEditAgentIsNew(e.target.checked)}
+                                            className="rounded border-gray-300 text-primary focus:ring-primary"
+                                        />
+                                        <label htmlFor="force-password-change" className="text-[9px] font-bold text-gray-400 uppercase tracking-wide cursor-pointer user-select-none">
+                                            Forcer le changement de MDP à la prochaine connexion
+                                        </label>
+                                    </div>
                                 </div>
                                 <div className="flex gap-4">
                                      <button 
@@ -3351,51 +3750,35 @@ const LoginPage = () => {
     const [view, setView] = useState<'login' | 'register'>('login');
     const [loginTab, setLoginTab] = useState<'agent' | 'taxpayer'>('agent');
     
-    // Taxpayer Registration Form States
-    const [regData, setRegData] = useState({ nif: '', email: '', password: '', name: '' });
+    // Taxpayer Registration Form States - Zero Password, Google Only
+    const [regData, setRegData] = useState({ nif: '', name: '' });
     const [regLoading, setRegLoading] = useState(false);
     const [regError, setRegError] = useState('');
 
-    // Taxpayer Login Form States
-    const [loginEmail, setLoginEmail] = useState('');
-    const [loginPassword, setLoginPassword] = useState('');
-    const [loginEmailLoading, setLoginEmailLoading] = useState(false);
-    const [loginError, setLoginError] = useState('');
-
-    const handleTaxpayerLogin = async (e: React.FormEvent) => {
+    const handleTaxpayerGoogleSignup = async (e: React.FormEvent) => {
         e.preventDefault();
-        setLoginEmailLoading(true);
-        setLoginError('');
-        try {
-            const { signInWithEmailAndPassword } = await import('firebase/auth');
-            await signInWithEmailAndPassword(auth, loginEmail, loginPassword);
-        } catch (err: any) {
-            setLoginError(err.message || 'Identifiants fiscaux invalides.');
-        } finally {
-            setLoginEmailLoading(false);
+        if (!regData.nif.trim()) {
+            setRegError('Le Numéro d’Impôt (NIF) est requis.');
+            return;
         }
-    };
-
-    const handleTaxpayerSignup = async (e: React.FormEvent) => {
-        e.preventDefault();
+        if (!regData.name.trim()) {
+            setRegError('La Raison Sociale / Nom professionnel est requis.');
+            return;
+        }
         setRegLoading(true);
         setRegError('');
         try {
-            const { createUserWithEmailAndPassword } = await import('firebase/auth');
-            const userCred = await createUserWithEmailAndPassword(auth, regData.email, regData.password);
+            // Store taxpayer registration details in localStorage so onAuthStateChanged can pick it up
+            localStorage.setItem('pending_taxpayer_reg', JSON.stringify({
+                taxNumber: regData.nif.trim(),
+                companyName: regData.name.trim()
+            }));
             
-            // Create profile in contribuables collection
-            await setDoc(doc(db, 'contribuables', userCred.user.uid), {
-                email: regData.email,
-                taxNumber: regData.nif,
-                companyName: regData.name,
-                role: 'contributor',
-                uid: userCred.user.uid
-            });
-            
-            // AppUser sync is handled by onAuthStateChanged
+            // Connect with Google to complete profile
+            await loginWithGoogle();
         } catch (err: any) {
-            setRegError(err.message || 'Erreur lors de l’inscription. Veuillez réessayer.');
+            setRegError(err.message || 'Erreur lors de la connexion Google.');
+            localStorage.removeItem('pending_taxpayer_reg');
         } finally {
             setRegLoading(false);
         }
@@ -3434,9 +3817,9 @@ const LoginPage = () => {
                             {/* Dual Tabs for Login Type */}
                             <div className="flex bg-gray-50 p-1.5 rounded-2xl border border-gray-100 mb-4">
                                 <button
-                                    onClick={() => { setLoginTab('agent'); setLoginError(''); }}
+                                    onClick={() => { setLoginTab('agent'); setRegError(''); }}
                                     className={cn(
-                                        "flex-1 py-3 text-[9px] font-black uppercase tracking-widest rounded-xl transition-all",
+                                        "flex-1 py-3 text-[10px] font-black uppercase tracking-widest rounded-xl transition-all",
                                         loginTab === 'agent' 
                                             ? "bg-white text-primary shadow-sm ring-1 ring-black/5" 
                                             : "text-gray-400 hover:text-gray-600"
@@ -3445,9 +3828,9 @@ const LoginPage = () => {
                                     Espace Métier (Agent)
                                 </button>
                                 <button
-                                    onClick={() => { setLoginTab('taxpayer'); setLoginError(''); }}
+                                    onClick={() => { setLoginTab('taxpayer'); setRegError(''); }}
                                     className={cn(
-                                        "flex-1 py-3 text-[9px] font-black uppercase tracking-widest rounded-xl transition-all",
+                                        "flex-1 py-3 text-[10px] font-black uppercase tracking-widest rounded-xl transition-all",
                                         loginTab === 'taxpayer' 
                                             ? "bg-white text-primary shadow-sm ring-1 ring-black/5" 
                                             : "text-gray-400 hover:text-gray-600"
@@ -3458,9 +3841,37 @@ const LoginPage = () => {
                             </div>
 
                             {loginTab === 'agent' ? (
-                                <div className="space-y-6">
+                                <div className="space-y-6 animate-in fade-in duration-300">
+                                    <p className="text-center text-[10px] text-gray-400 font-bold uppercase tracking-widest leading-relaxed max-w-xs mx-auto text-primary">
+                                        ACCÈS SÉCURISÉ AGENTS & CADRES DGI
+                                    </p>
                                     <p className="text-center text-[10px] text-gray-400 font-medium leading-relaxed max-w-xs mx-auto">
-                                        Accès réservé aux agents agréés de la DGI habilités à la vérification et au suivi fiscal.
+                                        Connexion instantanée sans mot de passe via votre adresse e-mail professionnelle certifiée.
+                                    </p>
+                                    <button 
+                                        onClick={loginWithGoogle}
+                                        disabled={authActionLoading}
+                                        className={cn(
+                                            "w-full group flex items-center justify-center gap-6 px-10 py-6 bg-white border-2 border-primary/20 rounded-3xl hover:border-primary hover:bg-primary/5 transition-all shadow-xl shadow-primary/5 hover:shadow-primary/10 active:scale-[0.98]",
+                                            authActionLoading && "opacity-50 cursor-not-allowed"
+                                        )}
+                                    >
+                                        {authActionLoading ? (
+                                            <RefreshCw className="animate-spin text-primary" size={24} />
+                                        ) : (
+                                            <div className="w-8 h-8 rounded-full overflow-hidden shrink-0">
+                                                <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="G" className="w-full h-full" />
+                                            </div>
+                                        )}
+                                        <span className="text-[10px] font-black text-primary uppercase tracking-[0.15em] transition-colors">
+                                            {authActionLoading ? "Authentification..." : "Connexion Professionnelle Google"}
+                                        </span>
+                                    </button>
+                                </div>
+                            ) : (
+                                <div className="space-y-6 animate-in fade-in duration-300">
+                                    <p className="text-center text-[10px] text-gray-400 font-medium leading-relaxed max-w-xs mx-auto">
+                                        Espace dédié aux contribuables de la RDC. Connectez-vous instantanément et de façon sécurisée via Google. Ce portail ne requiert aucun mot de passe.
                                     </p>
                                     <button 
                                         onClick={loginWithGoogle}
@@ -3478,50 +3889,10 @@ const LoginPage = () => {
                                             </div>
                                         )}
                                         <span className="text-[10px] font-black text-[#2C3E50] uppercase tracking-[0.15em] transition-colors">
-                                            {authActionLoading ? "Authentification..." : "Connexion avec Google"}
+                                            {authActionLoading ? "Connexion en cours..." : "Se connecter via Google"}
                                         </span>
                                     </button>
                                 </div>
-                            ) : (
-                                <form onSubmit={handleTaxpayerLogin} className="space-y-4 animate-in fade-in duration-300">
-                                    <div className="space-y-3">
-                                        <div className="relative">
-                                            <input 
-                                                required
-                                                type="email"
-                                                placeholder="Adresse email contribuable"
-                                                className="w-full pl-6 pr-6 py-4 bg-gray-50 border border-gray-100 rounded-xl outline-none focus:ring-4 focus:ring-primary/5 text-xs font-bold"
-                                                value={loginEmail}
-                                                onChange={e => setLoginEmail(e.target.value)}
-                                            />
-                                        </div>
-                                        <div className="relative">
-                                            <input 
-                                                required
-                                                type="password"
-                                                placeholder="Mot de passe"
-                                                className="w-full pl-6 pr-6 py-4 bg-gray-50 border border-gray-100 rounded-xl outline-none focus:ring-4 focus:ring-primary/5 text-xs font-bold"
-                                                value={loginPassword}
-                                                onChange={e => setLoginPassword(e.target.value)}
-                                            />
-                                        </div>
-                                    </div>
-
-                                    {loginError && (
-                                        <div className="p-4 bg-red-50 rounded-xl flex items-center gap-2 text-red-600 border border-red-100">
-                                            <AlertCircle size={14} />
-                                            <p className="text-[10px] font-black uppercase tracking-tight">{loginError}</p>
-                                        </div>
-                                    )}
-
-                                    <button 
-                                        type="submit"
-                                        disabled={loginEmailLoading}
-                                        className="w-full py-5 bg-primary text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-xl shadow-primary/20 hover:brightness-110 disabled:opacity-50"
-                                    >
-                                        {loginEmailLoading ? "Connexion en cours..." : "Se connecter au Portail"}
-                                    </button>
-                                </form>
                             )}
 
                             <div className="relative flex items-center py-4">
@@ -3538,7 +3909,7 @@ const LoginPage = () => {
                             </button>
                         </div>
                     ) : (
-                        <form onSubmit={handleTaxpayerSignup} className="space-y-5 animate-in slide-in-from-right duration-500">
+                        <form onSubmit={handleTaxpayerGoogleSignup} className="space-y-5 animate-in slide-in-from-right duration-500">
                              <div className="space-y-4">
                                 <div className="relative">
                                     <input 
@@ -3552,30 +3923,10 @@ const LoginPage = () => {
                                 <div className="relative">
                                     <input 
                                         required
-                                        placeholder="Raison Sociale"
+                                        placeholder="Raison Sociale / Informations Professionnelles"
                                         className="w-full pl-6 pr-6 py-4 bg-gray-50 border border-gray-100 rounded-xl outline-none focus:ring-4 focus:ring-primary/5 text-xs font-bold"
                                         value={regData.name}
                                         onChange={e => setRegData({...regData, name: e.target.value})}
-                                    />
-                                </div>
-                                <div className="relative">
-                                    <input 
-                                        required
-                                        type="email"
-                                        placeholder="Email Professionnel"
-                                        className="w-full pl-6 pr-6 py-4 bg-gray-50 border border-gray-100 rounded-xl outline-none focus:ring-4 focus:ring-primary/5 text-xs font-bold"
-                                        value={regData.email}
-                                        onChange={e => setRegData({...regData, email: e.target.value})}
-                                    />
-                                </div>
-                                <div className="relative">
-                                    <input 
-                                        required
-                                        type="password"
-                                        placeholder="Mot de passe"
-                                        className="w-full pl-6 pr-6 py-4 bg-gray-50 border border-gray-100 rounded-xl outline-none focus:ring-4 focus:ring-primary/5 text-xs font-bold"
-                                        value={regData.password}
-                                        onChange={e => setRegData({...regData, password: e.target.value})}
                                     />
                                 </div>
                             </div>
@@ -3597,10 +3948,10 @@ const LoginPage = () => {
                                 </button>
                                 <button 
                                     type="submit"
-                                    disabled={regLoading}
-                                    className="flex-1 py-4 bg-primary text-white rounded-xl text-[10px] font-black uppercase tracking-widest shadow-xl shadow-primary/20 hover:brightness-110 disabled:opacity-50"
+                                    disabled={regLoading || authActionLoading}
+                                    className="flex-1 py-4 bg-primary text-white rounded-xl text-[10px] font-black uppercase tracking-widest shadow-xl shadow-primary/20 hover:brightness-110 disabled:opacity-50 flex items-center justify-center gap-2"
                                 >
-                                    {regLoading ? "Activation..." : "S'enregistrer"}
+                                    {regLoading ? "Activation..." : "S'associer à Google"}
                                 </button>
                             </div>
                         </form>
@@ -3749,6 +4100,13 @@ const OnboardingPage = () => {
                 isSetup: true,
                 isNew: false // No longer new after setup
             });
+            await setDoc(doc(db, 'contribuables', user.uid), {
+                uid: user.uid,
+                email: user.email,
+                taxNumber: formData.taxNumber,
+                companyName: formData.company,
+                role: 'contributor'
+            }, { merge: true });
             window.location.reload();
         } catch (e) {
             console.error('Onboarding failed', e);
@@ -3919,8 +4277,24 @@ const DirectoryPage = () => {
             await updateDoc(doc(db, 'users', taxpayerId), {
                 assignedAgentId: agent.uid,
                 assignedAgentName: agent.displayName,
+                assignedAgentEmail: agent.email,
                 updatedAt: serverTimestamp()
             });
+
+            // Retroactively assign existing conversations to the agent too
+            const convsSnap = await getDocs(query(
+                collection(db, 'conversations'), 
+                where('contributorId', '==', taxpayerId)
+            ));
+            for (const convDoc of convsSnap.docs) {
+                await updateDoc(convDoc.ref, {
+                    agentId: agent.uid,
+                    assignedAgentId: agent.uid,
+                    assignedAgentEmail: agent.email,
+                    assignedAgentName: agent.displayName
+                });
+            }
+
             setTransferTarget(null);
             setStatus("Dossier transféré avec succès.");
         } catch (e) {
@@ -3965,13 +4339,30 @@ const DirectoryPage = () => {
 
     useEffect(() => {
         if (selectedUser && user && user.role !== 'contributor') {
-            const q = query(
-                collection(db, 'conversations'), 
-                where('participants', 'array-contains', selectedUser.uid), 
-                orderBy('lastUpdate', 'desc')
-            );
+            const isSuperAdmin = user.email === 'sibinimigjc@gmail.com';
+            let q;
+            if (isSuperAdmin) {
+                q = query(
+                    collection(db, 'conversations'), 
+                    where('participants', 'array-contains', selectedUser.uid)
+                );
+            } else {
+                q = query(
+                    collection(db, 'conversations'), 
+                    where('assignedAgentId', '==', user.uid)
+                );
+            }
             return onSnapshot(q, (snap) => {
-                setHistory(snap.docs.map(d => ({ id: d.id, ...d.data() } as Conversation)));
+                let list = snap.docs.map(d => ({ id: d.id, ...d.data() } as Conversation));
+                if (!isSuperAdmin) {
+                    list = list.filter(c => c.participants.includes(selectedUser.uid));
+                }
+                list.sort((a, b) => {
+                    const tA = a.lastUpdate?.toMillis ? a.lastUpdate.toMillis() : (a.lastUpdate?.seconds ? a.lastUpdate.seconds * 1000 : 0);
+                    const tB = b.lastUpdate?.toMillis ? b.lastUpdate.toMillis() : (b.lastUpdate?.seconds ? b.lastUpdate.seconds * 1000 : 0);
+                    return tB - tA;
+                });
+                setHistory(list);
             }, (err) => handleFirestoreError(err, OperationType.LIST, `conversations_history_${selectedUser.uid}`));
         }
     }, [selectedUser, user]);
@@ -5158,7 +5549,7 @@ const AdminGuard = ({ children }: { children: React.ReactNode }) => {
   const [pass, setPass] = useState('');
   const [error, setError] = useState('');
 
-  if (user?.role !== 'admin') return <Navigate to="/" />;
+  if (user?.role !== 'admin' && user?.role !== 'agent') return <Navigate to="/" />;
 
   if (!isAdminAuthenticated) {
     return (

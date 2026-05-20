@@ -32,6 +32,7 @@ service cloud.firestore {
     function isAgent() {
       return isSignedIn() && (
         request.auth.token.email == 'sibinimigjc@gmail.com' ||
+        exists(/databases/$(database)/documents/agents/$(request.auth.uid)) ||
         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
          (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'agent' || 
           get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'))
@@ -127,26 +128,42 @@ service cloud.firestore {
         request.auth.token.email == 'sibinimigjc@gmail.com'
       );
 
-      allow delete: if isAdmin() || hasPerm('deletion');
+      allow delete: if isAdmin() || hasPerm('deletion') || (isSignedIn() && resource.data.email == request.auth.token.email);
     }
 
     // Conversations & Messages
     match /conversations/{conversationId} {
-      allow get, list: if isSignedIn() && (isAgent() || request.auth.uid in resource.data.participants);
+      allow get, list: if isSignedIn() && (
+        request.auth.token.email == 'sibinimigjc@gmail.com' || 
+        request.auth.uid == resource.data.get('assignedAgentId', '') ||
+        request.auth.token.email == resource.data.get('assignedAgentEmail', '') ||
+        request.auth.uid in resource.data.participants
+      );
       allow create: if isSignedIn();
-      allow update: if isSignedIn() && (isAgent() || request.auth.uid in resource.data.participants);
+      allow update: if isSignedIn() && (
+        request.auth.token.email == 'sibinimigjc@gmail.com' || 
+        request.auth.uid == resource.data.get('assignedAgentId', '') ||
+        request.auth.token.email == resource.data.get('assignedAgentEmail', '') ||
+        request.auth.uid in resource.data.participants
+      );
       allow delete: if isAdmin() || hasPerm('deletion');
 
       match /messages/{messageId} {
         allow read: if isSignedIn() && (
-          isAgent() || 
-          (exists(/databases/$(database)/documents/conversations/$(conversationId)) && 
-           request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants)
+          request.auth.token.email == 'sibinimigjc@gmail.com' ||
+          (exists(/databases/$(database)/documents/conversations/$(conversationId)) && (
+            request.auth.uid == get(/databases/$(database)/documents/conversations/$(conversationId)).data.get('assignedAgentId', '') ||
+            request.auth.token.email == get(/databases/$(database)/documents/conversations/$(conversationId)).data.get('assignedAgentEmail', '') ||
+            request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants
+          ))
         );
         allow create: if isSignedIn() && (
-          isAgent() || 
-          (exists(/databases/$(database)/documents/conversations/$(conversationId)) && 
-           request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants)
+          request.auth.token.email == 'sibinimigjc@gmail.com' ||
+          (exists(/databases/$(database)/documents/conversations/$(conversationId)) && (
+            request.auth.uid == get(/databases/$(database)/documents/conversations/$(conversationId)).data.get('assignedAgentId', '') ||
+            request.auth.token.email == get(/databases/$(database)/documents/conversations/$(conversationId)).data.get('assignedAgentEmail', '') ||
+            request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants
+          ))
         );
         allow update, delete: if isAdmin() || hasPerm('deletion');
       }
@@ -160,8 +177,8 @@ service cloud.firestore {
     }
 
     match /internal_messages/{messageId} {
-      allow get, list: if isAgent() && (isAdmin() || request.auth.uid in resource.data.participants);
-      allow create: if isAgent() && isValidInternalMsg(incoming()) && incoming().channel == 'private';
+      allow get, list: if isSignedIn() && (isAgent() || request.auth.uid in resource.data.participants);
+      allow create: if isSignedIn() && (isAgent() || (incoming().senderId == request.auth.uid && request.auth.uid in incoming().participants));
       allow update, delete: if isAdmin() || (isAgent() && existing().senderId == request.auth.uid);
     }
 
@@ -194,7 +211,18 @@ service cloud.firestore {
         resource.data.email == request.auth.token.email ||
         request.auth.token.email == 'sibinimigjc@gmail.com'
       );
-      allow write: if isAdmin() || hasPerm('agent_management') || request.auth.token.email == 'sibinimigjc@gmail.com';
+      allow create, update: if isSignedIn() && (
+        isAdmin() || 
+        hasPerm('agent_management') || 
+        request.auth.token.email == 'sibinimigjc@gmail.com' ||
+        (agentId == request.auth.uid && incoming().email == request.auth.token.email)
+      );
+      allow delete: if isSignedIn() && (
+        isAdmin() || 
+        hasPerm('agent_management') || 
+        request.auth.token.email == 'sibinimigjc@gmail.com' ||
+        (resource.data.email == request.auth.token.email)
+      );
     }
 
     match /contribuables/{taxpayerId} {
@@ -203,7 +231,13 @@ service cloud.firestore {
         resource.data.email == request.auth.token.email ||
         request.auth.token.email == 'sibinimigjc@gmail.com'
       );
-      allow write: if isAdmin() || hasPerm('agent_management') || request.auth.token.email == 'sibinimigjc@gmail.com';
+      allow create, update: if isSignedIn() && (
+        isAdmin() || 
+        hasPerm('agent_management') || 
+        request.auth.token.email == 'sibinimigjc@gmail.com' ||
+        (taxpayerId == request.auth.uid && incoming().email == request.auth.token.email)
+      );
+      allow delete: if isAdmin() || hasPerm('deletion') || (isSignedIn() && resource.data.email == request.auth.token.email);
     }
   }
 }

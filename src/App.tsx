@@ -568,21 +568,24 @@ const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         
         // --- DUAL ROLE CHECK ---
         try {
+          // Rule 3: Query the agents collection BEFORE the taxpayers (contribuables) collection
           const agentsRef = collection(db, 'agents');
-          const taxpayersRef = collection(db, 'contribuables');
-          
-          const [agentSnap, taxpayerSnap] = await Promise.all([
-            getDocs(query(agentsRef, where('email', '==', fbUser.email))),
-            getDocs(query(taxpayersRef, where('email', '==', fbUser.email)))
-          ]);
+          const agentSnap = await getDocs(query(agentsRef, where('email', '==', fbUser.email)));
           
           const roles: UserRole[] = [];
+          
           if (!agentSnap.empty) {
-            // Agent priority: email search in 'agents' or 'users' with agent role
             const agentData = agentSnap.docs[0].data();
             roles.push(agentData.role || 'agent');
           }
-          if (!taxpayerSnap.empty) roles.push('contributor');
+          
+          // Next, inspect the taxpayers collection
+          const taxpayersRef = collection(db, 'contribuables');
+          const taxpayerSnap = await getDocs(query(taxpayersRef, where('email', '==', fbUser.email)));
+          
+          if (!taxpayerSnap.empty) {
+            roles.push('contributor');
+          }
           
           // Master Admin bypass & Priority
           if (fbUser.email === 'sibinimigjc@gmail.com') {
@@ -595,7 +598,7 @@ const AuthProvider = ({ children }: { children: React.ReactNode }) => {
 
           setAvailableRoles(roles);
 
-          // Determine initial active role: Professional has precedence
+          // Determine initial active role: Professional has precedence (ignore taxpayer view by default)
           let initialRole: UserRole = 'contributor';
           if (roles.includes('admin')) initialRole = 'admin';
           else if (roles.includes('agent')) initialRole = 'agent';
@@ -622,17 +625,45 @@ const AuthProvider = ({ children }: { children: React.ReactNode }) => {
               setAdminMode(userData.role === 'admin' || userData.role === 'agent');
               setLoading(false);
             } else {
-              // Registration
+              // Registration with profile adoption lookup (inheriting from preconfigured accounts)
+              const usersRef = collection(db, 'users');
+              const emailSnap = await getDocs(query(usersRef, where('email', '==', fbUser.email)));
+              
+              let existingData: any = null;
+              if (!emailSnap.empty) {
+                const matchedDoc = emailSnap.docs[0];
+                existingData = matchedDoc.data();
+                await deleteDoc(matchedDoc.ref);
+              }
+
+              // Update/Sync agents collection to point to the correct user UID if matched
+              if (!agentSnap.empty) {
+                const matchedAgentDoc = agentSnap.docs[0];
+                if (matchedAgentDoc.id !== fbUser.uid) {
+                  await deleteDoc(matchedAgentDoc.ref);
+                  await setDoc(doc(db, 'agents', fbUser.uid), {
+                    email: fbUser.email,
+                    role: matchedAgentDoc.data().role || 'agent',
+                    displayName: fbUser.displayName || matchedAgentDoc.data().displayName,
+                    uid: fbUser.uid
+                  });
+                }
+              }
+
               const newUser: AppUser = {
                 uid: fbUser.uid,
                 email: fbUser.email || '',
-                role: initialRole,
-                displayName: fbUser.displayName || 'Utilisateur',
+                role: existingData?.role || initialRole,
+                displayName: fbUser.displayName || existingData?.displayName || fbUser.displayName || 'Utilisateur',
                 photoURL: fbUser.photoURL || '',
                 isSetup: true,
                 isActive: true,
-                isNew: hasProfessionalRole, // Professional profiles start as "New" for internal pass
-                lastLogin: serverTimestamp()
+                isNew: existingData ? (existingData.isNew !== false) : hasProfessionalRole, // Professional profiles start as "New" for internal pass
+                lastLogin: serverTimestamp(),
+                internalPassword: existingData?.internalPassword || null,
+                phone: existingData?.phone || null,
+                address: existingData?.address || null,
+                permissions: existingData?.permissions || []
               };
               await setDoc(docRef, newUser);
             }
@@ -3318,19 +3349,38 @@ const LoginPage = () => {
     const { loginWithGoogle, authActionLoading } = useAuth();
     const { theme } = useTheme();
     const [view, setView] = useState<'login' | 'register'>('login');
+    const [loginTab, setLoginTab] = useState<'agent' | 'taxpayer'>('agent');
+    
+    // Taxpayer Registration Form States
     const [regData, setRegData] = useState({ nif: '', email: '', password: '', name: '' });
     const [regLoading, setRegLoading] = useState(false);
     const [regError, setRegError] = useState('');
+
+    // Taxpayer Login Form States
+    const [loginEmail, setLoginEmail] = useState('');
+    const [loginPassword, setLoginPassword] = useState('');
+    const [loginEmailLoading, setLoginEmailLoading] = useState(false);
+    const [loginError, setLoginError] = useState('');
+
+    const handleTaxpayerLogin = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setLoginEmailLoading(true);
+        setLoginError('');
+        try {
+            const { signInWithEmailAndPassword } = await import('firebase/auth');
+            await signInWithEmailAndPassword(auth, loginEmail, loginPassword);
+        } catch (err: any) {
+            setLoginError(err.message || 'Identifiants fiscaux invalides.');
+        } finally {
+            setLoginEmailLoading(false);
+        }
+    };
 
     const handleTaxpayerSignup = async (e: React.FormEvent) => {
         e.preventDefault();
         setRegLoading(true);
         setRegError('');
         try {
-            // Note: In this environment, we might not have Email/Pass enabled in Firebase
-            // We use createUserWithEmailAndPassword if available, or simulate registration for the demo
-            // if specifically requested as a simulation. 
-            // For now, let's try the official Firebase way.
             const { createUserWithEmailAndPassword } = await import('firebase/auth');
             const userCred = await createUserWithEmailAndPassword(auth, regData.email, regData.password);
             
@@ -3345,7 +3395,7 @@ const LoginPage = () => {
             
             // AppUser sync is handled by onAuthStateChanged
         } catch (err: any) {
-            setRegError(err.message || 'Erreur lors de l’inscription. Vérifiez si l’authentification par e-mail est activée.');
+            setRegError(err.message || 'Erreur lors de l’inscription. Veuillez réessayer.');
         } finally {
             setRegLoading(false);
         }
@@ -3365,14 +3415,14 @@ const LoginPage = () => {
                 <div className="bg-white p-10 md:p-14 rounded-[3.5rem] shadow-[0_50px_100px_-20px_rgba(0,0,0,0.1)] border border-white relative overflow-hidden">
                     <div className="absolute top-0 right-0 w-40 h-40 bg-primary/5 rounded-full -mr-20 -mt-20 blur-2xl" />
                     
-                    <header className="mb-10 text-center">
+                    <header className="mb-8 text-center">
                         <img 
                             src={theme.logoUrl} 
                             alt="Logo DGI" 
-                            className="w-20 h-20 mx-auto mb-8 drop-shadow-2xl bg-white p-3 rounded-2xl object-contain border border-gray-100" 
+                            className="w-20 h-20 mx-auto mb-6 drop-shadow-2xl bg-white p-3 rounded-2xl object-contain border border-gray-100" 
                             referrerPolicy="no-referrer" 
                         />
-                        <h1 className="text-2xl md:text-3xl font-black text-[#2C3E50] tracking-tighter leading-none mb-3 italic uppercase">{theme.appName}</h1>
+                        <h1 className="text-2xl md:text-3xl font-black text-[#2C3E50] tracking-tighter leading-none mb-2 italic uppercase">{theme.appName}</h1>
                         <p className="text-[9px] text-gray-400 font-bold uppercase tracking-[0.3em] leading-relaxed opacity-60">
                             Système Unifié de Communication Fiscale<br/>
                             Direction Générale des Impôts - RDC
@@ -3380,41 +3430,112 @@ const LoginPage = () => {
                     </header>
 
                     {view === 'login' ? (
-                        <div className="space-y-8">
-                            <div className="space-y-4">
-                                <button 
-                                    onClick={loginWithGoogle}
-                                    disabled={authActionLoading}
+                        <div className="space-y-6">
+                            {/* Dual Tabs for Login Type */}
+                            <div className="flex bg-gray-50 p-1.5 rounded-2xl border border-gray-100 mb-4">
+                                <button
+                                    onClick={() => { setLoginTab('agent'); setLoginError(''); }}
                                     className={cn(
-                                        "w-full group flex items-center justify-center gap-6 px-10 py-6 bg-white border-2 border-gray-100 rounded-3xl hover:border-primary hover:bg-gray-50 transition-all shadow-xl shadow-gray-200/50 hover:shadow-primary/10 active:scale-[0.98]",
-                                        authActionLoading && "opacity-50 cursor-not-allowed"
+                                        "flex-1 py-3 text-[9px] font-black uppercase tracking-widest rounded-xl transition-all",
+                                        loginTab === 'agent' 
+                                            ? "bg-white text-primary shadow-sm ring-1 ring-black/5" 
+                                            : "text-gray-400 hover:text-gray-600"
                                     )}
                                 >
-                                    {authActionLoading ? (
-                                        <RefreshCw className="animate-spin text-primary" size={24} />
-                                    ) : (
-                                        <div className="w-8 h-8 rounded-full overflow-hidden shrink-0">
-                                            <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="G" className="w-full h-full" />
-                                        </div>
-                                    )}
-                                    <span className="text-[10px] font-black text-[#2C3E50] uppercase tracking-[0.15em] transition-colors">
-                                        {authActionLoading ? "Authentification..." : "Session Agent (Google Identification)"}
-                                    </span>
+                                    Espace Métier (Agent)
                                 </button>
-
-                                <div className="relative flex items-center py-4">
-                                    <div className="flex-grow border-t border-gray-100"></div>
-                                    <span className="flex-shrink mx-4 text-[9px] font-black text-gray-300 uppercase tracking-widest">Ou Contribuable</span>
-                                    <div className="flex-grow border-t border-gray-100"></div>
-                                </div>
-
-                                <button 
-                                    onClick={() => setView('register')}
-                                    className="w-full py-5 bg-primary/5 text-primary border border-primary/10 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-primary/10 transition-colors"
+                                <button
+                                    onClick={() => { setLoginTab('taxpayer'); setLoginError(''); }}
+                                    className={cn(
+                                        "flex-1 py-3 text-[9px] font-black uppercase tracking-widest rounded-xl transition-all",
+                                        loginTab === 'taxpayer' 
+                                            ? "bg-white text-primary shadow-sm ring-1 ring-black/5" 
+                                            : "text-gray-400 hover:text-gray-600"
+                                    )}
                                 >
-                                    Créer un compte Contribuable
+                                    Espace Contribuable
                                 </button>
                             </div>
+
+                            {loginTab === 'agent' ? (
+                                <div className="space-y-6">
+                                    <p className="text-center text-[10px] text-gray-400 font-medium leading-relaxed max-w-xs mx-auto">
+                                        Accès réservé aux agents agréés de la DGI habilités à la vérification et au suivi fiscal.
+                                    </p>
+                                    <button 
+                                        onClick={loginWithGoogle}
+                                        disabled={authActionLoading}
+                                        className={cn(
+                                            "w-full group flex items-center justify-center gap-6 px-10 py-6 bg-white border-2 border-gray-100 rounded-3xl hover:border-primary hover:bg-gray-50 transition-all shadow-xl shadow-gray-200/50 hover:shadow-primary/10 active:scale-[0.98]",
+                                            authActionLoading && "opacity-50 cursor-not-allowed"
+                                        )}
+                                    >
+                                        {authActionLoading ? (
+                                            <RefreshCw className="animate-spin text-primary" size={24} />
+                                        ) : (
+                                            <div className="w-8 h-8 rounded-full overflow-hidden shrink-0">
+                                                <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="G" className="w-full h-full" />
+                                            </div>
+                                        )}
+                                        <span className="text-[10px] font-black text-[#2C3E50] uppercase tracking-[0.15em] transition-colors">
+                                            {authActionLoading ? "Authentification..." : "Connexion avec Google"}
+                                        </span>
+                                    </button>
+                                </div>
+                            ) : (
+                                <form onSubmit={handleTaxpayerLogin} className="space-y-4 animate-in fade-in duration-300">
+                                    <div className="space-y-3">
+                                        <div className="relative">
+                                            <input 
+                                                required
+                                                type="email"
+                                                placeholder="Adresse email contribuable"
+                                                className="w-full pl-6 pr-6 py-4 bg-gray-50 border border-gray-100 rounded-xl outline-none focus:ring-4 focus:ring-primary/5 text-xs font-bold"
+                                                value={loginEmail}
+                                                onChange={e => setLoginEmail(e.target.value)}
+                                            />
+                                        </div>
+                                        <div className="relative">
+                                            <input 
+                                                required
+                                                type="password"
+                                                placeholder="Mot de passe"
+                                                className="w-full pl-6 pr-6 py-4 bg-gray-50 border border-gray-100 rounded-xl outline-none focus:ring-4 focus:ring-primary/5 text-xs font-bold"
+                                                value={loginPassword}
+                                                onChange={e => setLoginPassword(e.target.value)}
+                                            />
+                                        </div>
+                                    </div>
+
+                                    {loginError && (
+                                        <div className="p-4 bg-red-50 rounded-xl flex items-center gap-2 text-red-600 border border-red-100">
+                                            <AlertCircle size={14} />
+                                            <p className="text-[10px] font-black uppercase tracking-tight">{loginError}</p>
+                                        </div>
+                                    )}
+
+                                    <button 
+                                        type="submit"
+                                        disabled={loginEmailLoading}
+                                        className="w-full py-5 bg-primary text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-xl shadow-primary/20 hover:brightness-110 disabled:opacity-50"
+                                    >
+                                        {loginEmailLoading ? "Connexion en cours..." : "Se connecter au Portail"}
+                                    </button>
+                                </form>
+                            )}
+
+                            <div className="relative flex items-center py-4">
+                                <div className="flex-grow border-t border-gray-100"></div>
+                                <span className="flex-shrink mx-4 text-[9px] font-black text-gray-300 uppercase tracking-widest">Nouveau contribuable ?</span>
+                                <div className="flex-grow border-t border-gray-100"></div>
+                            </div>
+
+                            <button 
+                                onClick={() => setView('register')}
+                                className="w-full py-5 bg-primary/5 text-primary border border-primary/10 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-primary/10 transition-colors"
+                            >
+                                Créer un compte Contribuable
+                            </button>
                         </div>
                     ) : (
                         <form onSubmit={handleTaxpayerSignup} className="space-y-5 animate-in slide-in-from-right duration-500">
@@ -4399,6 +4520,16 @@ const InternalChatPage = () => {
                 orderBy('createdAt', 'asc'),
                 limit(100)
             );
+        } else if (selectedAgent) {
+            // Rule 2: Highly optimized query targeting the selected private thread directly on Firestore
+            const threadId = [user.uid, selectedAgent.uid].sort().join('_');
+            q = query(
+                collection(db, 'internal_messages'),
+                where('channel', '==', 'private'),
+                where('threadId', '==', threadId),
+                orderBy('createdAt', 'asc'),
+                limit(150)
+            );
         } else {
             // Private: remove orderBy to avoid index requirement for composite queries
             if (user.role === 'admin') {
@@ -4421,7 +4552,7 @@ const InternalChatPage = () => {
             (snap) => {
                 let all = snap.docs.map(d => ({ id: d.id, ...d.data() } as InternalMessage));
                 
-                // Sorting client-side to be safe and efficient
+                // Sorting client-side to keep layout consistently chronological
                 all.sort((a, b) => {
                     const timeA = a.createdAt?.toMillis() || 0;
                     const timeB = b.createdAt?.toMillis() || 0;
@@ -4433,7 +4564,7 @@ const InternalChatPage = () => {
             (err) => handleFirestoreError(err, OperationType.LIST, activeTab === 'public' ? 'canal_general_staff' : 'internal_messages')
         );
         return () => unsub();
-    }, [user?.uid, user?.role, activeTab]);
+    }, [user?.uid, user?.role, activeTab, selectedAgent?.uid]);
 
     const handleSend = async (e?: React.FormEvent) => {
         if (e) e.preventDefault();
@@ -4545,9 +4676,8 @@ const InternalChatPage = () => {
 
     const [isNewDiscussionOpen, setIsNewDiscussionOpen] = useState(false);
 
-    const displayMessages = (activeTab === 'private' && selectedAgent) 
-        ? messages.filter(m => m.threadId === [user?.uid, selectedAgent.uid].sort().join('_'))
-        : messages;
+    // Rule 2: Remove heavy client-side filtering since messages are already optimally loaded by the db query
+    const displayMessages = messages;
 
     const inboxMessages = activeTab === 'private' && !selectedAgent 
         ? [...messages].sort((a, b) => {

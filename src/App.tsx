@@ -1256,7 +1256,7 @@ const AppShell = ({ children }: { children: React.ReactNode }) => {
                 <SidebarLink to="/admin" icon={Layers} label="Vue Panoramique" active={location.pathname === '/admin'} />
                 <SidebarLink to="/messaging" icon={Mail} label="Conversations Contribuables" active={location.pathname === '/messaging'} />
                 <SidebarLink to="/internal" icon={MessageSquare} label="Conversations Staff" active={location.pathname === '/internal'} />
-                {(hasPermission(user, 'tax_consultation') || hasPermission(user, 'deletion') || (user as any)?.isSuperContribuable) && (
+                {(user?.role === 'admin' || user?.role === 'agent' || hasPermission(user, 'tax_consultation') || hasPermission(user, 'deletion') || (user as any)?.isSuperContribuable) && (
                     <SidebarLink to="/directory" icon={Users} label="Annuaire National" active={location.pathname === '/directory'} />
                 )}
               </>
@@ -1553,19 +1553,45 @@ const MessagingPage = () => {
     const [status, setStatus] = useState('');
     const [fileToView, setFileToView] = useState<Attachment | null>(null);
 
+    const stateHandledRef = useRef(false);
     useEffect(() => {
-        const state = location.state as { receiverId?: string; subject?: string } | null;
-        if (state?.receiverId) {
+        const state = location.state as { receiverId?: string; subject?: string; conversationId?: string; preselectUserId?: string } | null;
+        if (!state || stateHandledRef.current) return;
+
+        if (state.conversationId) {
+            const found = conversations.find(c => c.id === state.conversationId);
+            if (found) {
+                setSelectedConv(found);
+                stateHandledRef.current = true;
+                window.history.replaceState({}, document.title);
+            }
+        } else if (state.preselectUserId) {
+            const found = conversations.find(c => c.contributorId === state.preselectUserId || c.participants.includes(state.preselectUserId));
+            if (found) {
+                setSelectedConv(found);
+                stateHandledRef.current = true;
+                window.history.replaceState({}, document.title);
+            } else if (conversations.length > 0) {
+                setComposeData(prev => ({
+                    ...prev,
+                    receiverId: state.preselectUserId || 'global',
+                    subject: 'Nouveau message'
+                }));
+                setIsComposeOpen(true);
+                stateHandledRef.current = true;
+                window.history.replaceState({}, document.title);
+            }
+        } else if (state.receiverId) {
             setComposeData(prev => ({
                 ...prev,
                 receiverId: state.receiverId || 'global',
                 subject: state.subject || ''
             }));
             setIsComposeOpen(true);
-            // Clear location state to avoid re-opening on refresh
+            stateHandledRef.current = true;
             window.history.replaceState({}, document.title);
         }
-    }, [location]);
+    }, [location, conversations]);
 
     useEffect(() => {
         if (status) {
@@ -4305,37 +4331,66 @@ const DirectoryPage = () => {
     useEffect(() => {
         if (!user) return;
         const isSuper = (user as any).isSuperContribuable;
-        if (user.role === 'contributor' && !isSuper) return;
+        const isSuperAdmin = user.email === 'sibinimigjc@gmail.com';
 
-        const baseQuery = (user.role === 'admin' || isSuper) 
-            ? query(collection(db, 'users'))
-            : query(
-                collection(db, 'users'),
-                and(
-                    where('role', 'in', ['agent', 'admin']),
-                    or(
-                        where('assignedAgentId', '==', null),
+        // Fetch taxpayers (contributors) and staff based on roles to respect Firestore rules perfectly
+        let q;
+        if (activeTab === 'taxpayers') {
+            if (isSuperAdmin || user.role === 'admin' || isSuper) {
+                // Admins/Super-Admin can see all contributors
+                q = query(collection(db, 'users'), where('role', '==', 'contributor'));
+            } else {
+                // Agent/Gestionnaire can only see contributors assigned to them
+                q = query(
+                    collection(db, 'users'),
+                    and(
+                        where('role', '==', 'contributor'),
                         where('assignedAgentId', '==', user.uid)
                     )
-                )
-            );
-
-        const unsub = onSnapshot(baseQuery, (snap) => {
-            const all = snap.docs.map(d => ({ ...d.data(), uid: d.id } as AppUser));
-            setAllUsers(all);
-            if (activeTab === 'taxpayers') {
-                const list = all.filter(u => u.role === 'contributor');
-                if (user.role === 'agent' && !user.permissions?.includes('admin_view')) {
-                    setTaxpayers(list.filter(t => t.assignedAgentId === user.uid || !t.assignedAgentId)); // Include unassigned
-                } else {
-                    setTaxpayers(list);
-                }
-            } else {
-                setTaxpayers(all.filter(u => u.role === 'agent' || u.role === 'admin'));
+                );
             }
-        }, (err) => handleFirestoreError(err, OperationType.LIST, 'users_all'));
+        } else {
+            // Staff/agents tab
+            q = query(
+                collection(db, 'users'),
+                where('role', 'in', ['agent', 'admin'])
+            );
+        }
+
+        const unsub = onSnapshot(q, (snap) => {
+            const docs = snap.docs.map(d => ({ ...d.data(), uid: d.id } as AppUser));
+            setTaxpayers(docs);
+        }, (err) => handleFirestoreError(err, OperationType.LIST, `users_${activeTab}`));
+
         return () => unsub();
     }, [user, activeTab]);
+
+    useEffect(() => {
+        if (!user) return;
+        const isSuper = (user as any).isSuperContribuable;
+        const isSuperAdmin = user.email === 'sibinimigjc@gmail.com';
+
+        // Keep allUsers sync'ed with proper permissions
+        if (user.role === 'admin' || isSuper || isSuperAdmin) {
+            const q = query(collection(db, 'users'));
+            const unsub = onSnapshot(q, (snap) => {
+                setAllUsers(snap.docs.map(d => ({ ...d.data(), uid: d.id } as AppUser)));
+            }, (err) => handleFirestoreError(err, OperationType.LIST, 'users_all_admin'));
+            return () => unsub();
+        } else {
+            const q = query(
+                collection(db, 'users'),
+                and(
+                    where('role', '==', 'contributor'),
+                    where('assignedAgentId', '==', user.uid)
+                )
+            );
+            const unsub = onSnapshot(q, (snap) => {
+                setAllUsers(snap.docs.map(d => ({ ...d.data(), uid: d.id } as AppUser)));
+            }, (err) => handleFirestoreError(err, OperationType.LIST, 'users_assigned_agent'));
+            return () => unsub();
+        }
+    }, [user]);
 
     useEffect(() => {
         if (selectedUser && user && user.role !== 'contributor') {
@@ -4511,7 +4566,7 @@ const DirectoryPage = () => {
                                         <td className="px-10 py-6">
                                             {activeTab === 'taxpayers' ? (
                                                 <span className="px-4 py-1.5 bg-gray-50 text-primary border border-primary/10 rounded-full text-[10px] font-bold tabular-nums">
-                                                    {hasPermission(user, 'tax_consultation') ? (t.taxNumber || 'NIU-PENDING') : '********'}
+                                                    {(hasPermission(user, 'tax_consultation') || (user?.role === 'agent' && t.assignedAgentId === user?.uid)) ? (t.taxNumber || 'NIU-PENDING') : '********'}
                                                 </span>
                                             ) : (
                                                 <span className="text-[10px] font-bold text-gray-500 lowercase tracking-normal">{t.email}</span>
@@ -4567,18 +4622,38 @@ const DirectoryPage = () => {
                                                         <Trash2 size={18} />
                                                     </button>
                                                 )}
-                                                {(activeTab === 'staff' || (user as any).isSuperContribuable) && t.uid !== user?.uid ? (
-                                                    <button 
-                                                        onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            navigate('/messaging', { state: { receiverId: t.uid, subject: `Contact Agent ${t.displayName}` } });
-                                                        }}
-                                                        className="px-6 py-2 bg-primary text-white rounded-xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-primary/20 hover:brightness-110 active:scale-95 transition-all flex items-center gap-2"
-                                                    >
-                                                        <MessageSquare size={14} /> {activeTab === 'staff' ? 'Chat Privé' : 'Contacter'}
-                                                    </button>
+                                                {activeTab === 'taxpayers' ? (
+                                                    <div className="flex items-center gap-2">
+                                                        <button 
+                                                            onClick={() => setSelectedUser(t)}
+                                                            className="px-4 py-2 bg-white border border-gray-200 text-gray-600 rounded-xl text-[10px] font-black uppercase tracking-widest hover:border-primary hover:text-primary transition-all"
+                                                        >
+                                                            Historique / Fiche
+                                                        </button>
+                                                        <button 
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                navigate('/messaging', { state: { preselectUserId: t.uid } });
+                                                            }}
+                                                            className="px-4 py-2 bg-primary text-white rounded-xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-primary/10 hover:brightness-110 active:scale-95 transition-all flex items-center gap-2"
+                                                        >
+                                                            <MessageSquare size={14} /> Messagerie
+                                                        </button>
+                                                    </div>
                                                 ) : (
-                                                    <button className="px-6 py-2 bg-white border border-gray-200 text-gray-600 rounded-xl text-[10px] font-black uppercase tracking-widest hover:border-primary hover:text-primary transition-all">Historique</button>
+                                                    t.uid !== user?.uid ? (
+                                                        <button 
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                navigate('/messaging', { state: { receiverId: t.uid, subject: `Contact Agent ${t.displayName}` } });
+                                                            }}
+                                                            className="px-6 py-2 bg-primary text-white rounded-xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-primary/20 hover:brightness-110 active:scale-95 transition-all flex items-center gap-2"
+                                                        >
+                                                            <MessageSquare size={14} /> Chat Privé
+                                                        </button>
+                                                    ) : (
+                                                        <span className="text-[10px] text-gray-400 font-bold uppercase tracking-widest">Vous</span>
+                                                    )
                                                 )}
                                             </div>
                                         </td>
@@ -4798,10 +4873,22 @@ const DirectoryPage = () => {
                                 </div>
                             </div>
                         </div>
-                        <footer className="p-8 border-t border-gray-100 bg-white shrink-0 text-center">
+                        <footer className="p-8 border-t border-gray-100 bg-white shrink-0 flex items-center justify-center gap-4">
+                            {selectedUser.role === 'contributor' && (
+                                <button 
+                                    onClick={() => {
+                                        const tUid = selectedUser.uid;
+                                        setSelectedUser(null);
+                                        navigate('/messaging', { state: { preselectUserId: tUid } });
+                                    }}
+                                    className="px-10 py-4 bg-indigo-600 text-white rounded-2xl font-black text-xs uppercase tracking-[0.2em] shadow-xl shadow-indigo-600/20 hover:brightness-110 transition-all flex items-center gap-2"
+                                >
+                                    <MessageSquare size={16} /> Ouvrir Discussion
+                                </button>
+                            )}
                             <button 
                                 onClick={() => setSelectedUser(null)}
-                                className="px-10 py-4 bg-primary text-white rounded-2xl font-black text-xs uppercase tracking-[0.2em] shadow-xl shadow-primary/20 hover:brightness-110 transition-all"
+                                className="px-10 py-4 bg-gray-100 text-[#2C3E50] border border-gray-200 rounded-2xl font-black text-xs uppercase tracking-[0.2em] hover:bg-gray-200 transition-all"
                             >
                                 Fermer le Registre
                             </button>
@@ -5932,7 +6019,7 @@ const MainContent = () => {
                 {(user.role === 'admin' || user.role === 'agent') && (
                     <>
                         <Route path="/internal" element={<InternalChatPage />} />
-                        <Route path="/directory" element={(hasPermission(user, 'tax_consultation') || hasPermission(user, 'deletion')) ? <DirectoryPage /> : <Navigate to="/" />} />
+                        <Route path="/directory" element={<DirectoryPage />} />
                     </>
                 )}
                 <Route path="/settings" element={<SettingsPage />} />

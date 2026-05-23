@@ -239,5 +239,43 @@ service cloud.firestore {
       );
       allow delete: if isAdmin() || hasPerm('deletion') || (isSignedIn() && resource.data.email == request.auth.token.email);
     }
+
+    // GED (Gestion Électronique des Documents)
+    match /ged_items/{itemId} {
+      allow get: if isSignedIn() && isValidId(itemId) && (
+        resource.data.space == 'contributor' && (resource.data.contributorId == request.auth.uid || isAgent() || isSuper()) ||
+        resource.data.space == 'private' && (resource.data.ownerId == request.auth.uid || isAgent() || isSuper()) ||
+        resource.data.space == 'administrative' && (isAgent() || isSuper())
+      );
+
+      allow list: if isSignedIn() && (
+        isAgent() ||
+        isSuper() ||
+        (resource.data.space == 'contributor' && resource.data.contributorId == request.auth.uid) ||
+        (resource.data.space == 'private' && resource.data.ownerId == request.auth.uid)
+      );
+
+      allow create: if isSignedIn() && isValidId(itemId) && (
+        (incoming().space == 'contributor' && (incoming().contributorId == request.auth.uid || isAgent() || isSuper())) ||
+        (incoming().space == 'private' && incoming().ownerId == request.auth.uid) ||
+        (incoming().space == 'administrative' && (isAgent() || isSuper()))
+      );
+
+      allow update: if isSignedIn() && isValidId(itemId) && (
+        isAdmin() ||
+        isSuper() ||
+        (resource.data.space == 'private' && resource.data.ownerId == request.auth.uid) ||
+        (resource.data.space == 'contributor' && resource.data.contributorId == request.auth.uid) ||
+        (isAgent() && resource.data.space == 'administrative')
+      );
+
+      allow delete: if isSignedIn() && isValidId(itemId) && (
+        isAdmin() ||
+        isSuper() ||
+        (resource.data.space == 'private' && resource.data.ownerId == request.auth.uid) ||
+        (resource.data.space == 'contributor' && resource.data.contributorId == request.auth.uid) ||
+        (isAgent() && resource.data.space == 'administrative')
+      );
+    }
   }
 }

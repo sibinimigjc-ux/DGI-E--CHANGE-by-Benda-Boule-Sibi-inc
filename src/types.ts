@@ -14,10 +14,13 @@ export interface AppUser {
   managerName?: string;
   companyPhotoUrl?: string;
   phone?: string;
+  firstName?: string;
+  lastName?: string;
   isFirstLogin?: boolean;
   securityCode?: string;
   assignedAgentId?: string; // For contributors: who manages them
   assignedAgentName?: string; 
+  matricule?: string;
   isSetup: boolean;
   isActive: boolean;
   isNew?: boolean;
@@ -29,6 +32,37 @@ export interface AppUser {
   invitedBy?: string;
   tempPassword?: string;
   permissions?: AgentPermission[];
+  status?: 'active' | 'suspended' | 'archived' | 'deleted_trash';
+  deletedAt?: any;
+  restrictGedAdmin?: boolean;
+  gedPasscode?: string;
+}
+
+export interface GedItem {
+  id: string;
+  name: string;
+  type: 'folder' | 'file';
+  parentId: string | null;
+  space: 'private' | 'administrative' | 'contributor';
+  ownerId: string;
+  ownerEmail?: string;
+  contributorId?: string;
+  extension?: string;
+  fileUrl?: string;
+  fileSize?: number;
+  isDeleted: boolean;
+  deletedAt?: any;
+  isLocked?: boolean;
+  lockPasscode?: string;
+  createdBy: {
+    uid: string;
+    displayName: string;
+    firstName: string;
+    lastName: string;
+    matricule: string;
+  };
+  createdAt: any;
+  updatedAt?: any;
 }
 
 export interface Invitation {

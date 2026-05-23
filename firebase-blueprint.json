@@ -100,6 +100,26 @@
         "cardShadow": { "type": "string", "enum": ["none", "sm", "md", "lg", "xl", "2xl"] },
         "componentPadding": { "type": "string", "enum": ["compact", "normal", "relaxed"] }
       }
+    },
+    "GedItem": {
+      "title": "GedItem",
+      "description": "Secure digital file or folder for document management",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "type": { "type": "string", "enum": ["file", "folder"] },
+        "parentId": { "type": "string" },
+        "space": { "type": "string", "enum": ["private", "administrative", "contributor"] },
+        "ownerId": { "type": "string" },
+        "ownerEmail": { "type": "string" },
+        "extension": { "type": "string" },
+        "fileUrl": { "type": "string" },
+        "fileSize": { "type": "number" },
+        "isDeleted": { "type": "boolean" },
+        "createdBy": { "type": "object" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "type", "space", "ownerId", "isDeleted", "createdBy"]
     }
   },
   "firestore": {
@@ -138,6 +158,10 @@
     "/config/studio": {
       "schema": "ThemeConfig",
       "description": "Studio branding settings"
+    },
+    "/ged_items/{itemId}": {
+      "schema": "GedItem",
+      "description": "Secure digital files and folders managed via GED"
     }
   }
 }

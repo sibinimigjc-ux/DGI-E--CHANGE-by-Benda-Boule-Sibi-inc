@@ -98,7 +98,32 @@ async function testConnection() {
   }
 }
 
+const playNotificationSound = () => {
+  try {
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtx) return;
+    const audioContext = new AudioCtx();
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+    
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    
+    oscillator.type = 'sine';
+    oscillator.frequency.setValueAtTime(880, audioContext.currentTime); // A5 note
+    
+    gainNode.gain.setValueAtTime(0.06, audioContext.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.18);
+    
+    oscillator.start(audioContext.currentTime);
+    oscillator.stop(audioContext.currentTime + 0.18);
+  } catch (error) {
+    console.warn("Failed to play notification audio:", error);
+  }
+};
+
 import * as Dialog from '@radix-ui/react-dialog';
+import GedPage from './GedPage';
 import { AppUser, DEFAULT_THEME, ThemeConfig, Exchange, InternalMessage, Attachment, Conversation, Invitation, UserRole, AgentPermission } from './types';
 import { 
   Building2, 
@@ -109,6 +134,7 @@ import {
   Users, 
   Paperclip, 
   Send, 
+  HardDrive, 
   Search, 
   Menu,
   X, 
@@ -807,7 +833,7 @@ const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   );
 };
 
-const useAuth = () => {
+export const useAuth = () => {
   const context = useContext(AuthContext);
   if (!context) throw new Error('useAuth must be used within AuthProvider');
   return context;
@@ -819,7 +845,7 @@ const useTheme = () => {
   return context;
 };
 
-const hasPermission = (user: AppUser | null, permission: AgentPermission) => {
+export const hasPermission = (user: AppUser | null, permission: AgentPermission) => {
     if (!user) return false;
     if (user.email === 'sibinimigjc@gmail.com' || user.role === 'admin') return true;
     return user.permissions?.includes(permission);
@@ -1246,6 +1272,7 @@ const AppShell = ({ children }: { children: React.ReactNode }) => {
                 </div>
                 <SidebarLink to="/" icon={Layout} label="Tableau de Bord" active={location.pathname === '/'} />
                 <SidebarLink to="/messaging" icon={Mail} label="Mes Conversations" active={location.pathname === '/messaging'} />
+                <SidebarLink to="/ged" icon={HardDrive} label="Gestion des dossiers" active={location.pathname === '/ged'} />
                 <SidebarLink to="/account" icon={UserCircle} label="Mon Compte" active={location.pathname === '/account'} />
               </>
             ) : (
@@ -1256,6 +1283,7 @@ const AppShell = ({ children }: { children: React.ReactNode }) => {
                 <SidebarLink to="/admin" icon={Layers} label="Vue Panoramique" active={location.pathname === '/admin'} />
                 <SidebarLink to="/messaging" icon={Mail} label="Conversations Contribuables" active={location.pathname === '/messaging'} />
                 <SidebarLink to="/internal" icon={MessageSquare} label="Conversations Staff" active={location.pathname === '/internal'} />
+                <SidebarLink to="/ged" icon={HardDrive} label="Gestion GED" active={location.pathname === '/ged'} />
                 {(user?.role === 'admin' || user?.role === 'agent' || hasPermission(user, 'tax_consultation') || hasPermission(user, 'deletion') || (user as any)?.isSuperContribuable) && (
                     <SidebarLink to="/directory" icon={Users} label="Annuaire National" active={location.pathname === '/directory'} />
                 )}
@@ -1553,6 +1581,136 @@ const MessagingPage = () => {
     const [status, setStatus] = useState('');
     const [fileToView, setFileToView] = useState<Attachment | null>(null);
 
+    // GED Transfer Gateway State
+    const [gedTransferFile, setGedTransferFile] = useState<Attachment | null>(null);
+    const [gedTransferSpace, setGedTransferSpace] = useState<'private' | 'administrative' | 'contributor'>('private');
+    const [gedTransferFolder, setGedTransferFolder] = useState<string>('root');
+    const [gedTransferFolders, setGedTransferFolders] = useState<any[]>([]);
+    const [isTransferringGed, setIsTransferringGed] = useState<boolean>(false);
+    const [gedTransferName, setGedTransferName] = useState<string>('');
+
+    useEffect(() => {
+        if (!gedTransferFile) return;
+        setGedTransferName(gedTransferFile.name);
+        if (user?.role === 'contributor') {
+            setGedTransferSpace('contributor');
+        } else {
+            setGedTransferSpace('private');
+        }
+    }, [gedTransferFile, user]);
+
+    useEffect(() => {
+        if (!gedTransferFile || !user) return;
+        let q = query(
+            collection(db, 'ged_items'), 
+            where('type', '==', 'folder'),
+            where('space', '==', gedTransferSpace),
+            where('isDeleted', '==', false)
+        );
+        if (gedTransferSpace === 'private') {
+            q = query(
+                collection(db, 'ged_items'), 
+                where('type', '==', 'folder'),
+                where('space', '==', 'private'),
+                where('ownerId', '==', user.uid),
+                where('isDeleted', '==', false)
+            );
+        } else if (gedTransferSpace === 'contributor' && user.role === 'contributor') {
+            q = query(
+                collection(db, 'ged_items'), 
+                where('type', '==', 'folder'),
+                where('space', '==', 'contributor'),
+                where('contributorId', '==', user.uid),
+                where('isDeleted', '==', false)
+            );
+        }
+        
+        getDocs(q).then((snap) => {
+            setGedTransferFolders(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+        }).catch(err => {
+            console.error(err);
+        });
+    }, [gedTransferFile, gedTransferSpace, user]);
+
+    const handleConfirmGedTransfer = async () => {
+        if (!gedTransferFile || !user) return;
+        setIsTransferringGed(true);
+        try {
+            const parentIdVal = gedTransferFolder === 'root' ? null : gedTransferFolder;
+            const existingQ = query(
+                collection(db, 'ged_items'),
+                where('space', '==', gedTransferSpace),
+                where('parentId', '==', parentIdVal),
+                where('isDeleted', '==', false)
+            );
+            const existingSnap = await getDocs(existingQ);
+            const existingNames = existingSnap.docs.map(d => (d.data() as any).name);
+            
+            const helperUniqueName = (proposed: string, list: string[]): string => {
+                if (!list.map(n => n.toLowerCase()).includes(proposed.toLowerCase())) return proposed;
+                let bName = proposed;
+                let ext = '';
+                const lastDotIdx = proposed.lastIndexOf('.');
+                if (lastDotIdx !== -1 && lastDotIdx > 0) {
+                    bName = proposed.substring(0, lastDotIdx);
+                    ext = proposed.substring(lastDotIdx);
+                }
+                let cand = '';
+                if (bName.endsWith('-copie')) {
+                    cand = `${bName}-1${ext}`;
+                } else if (/-copie-(\d+)$/.test(bName)) {
+                    const match = bName.match(/-copie-(\d+)$/);
+                    const num = parseInt(match![1]) + 1;
+                    cand = `${bName.replace(/-copie-\d+$/, `-copie-${num}`)}${ext}`;
+                } else if (/\d+$/.test(bName)) {
+                    const match = bName.match(/(\d+)$/);
+                    const num = parseInt(match![1]) + 1;
+                    cand = `${bName.replace(/\d+$/, String(num))}${ext}`;
+                } else {
+                    cand = ext ? `${bName}-copie${ext}` : `${bName}-2`;
+                }
+                return helperUniqueName(cand, list);
+            };
+
+            const finalUniqueName = helperUniqueName(gedTransferName.trim() || gedTransferFile.name, existingNames);
+            const fileExtension = finalUniqueName.split('.').pop()?.toLowerCase() || 'bin';
+
+            const newGedItem: any = {
+                name: finalUniqueName,
+                type: 'file',
+                parentId: parentIdVal,
+                space: gedTransferSpace,
+                ownerId: user.uid,
+                ownerEmail: user.email,
+                extension: fileExtension,
+                fileUrl: gedTransferFile.url,
+                fileSize: 0,
+                isDeleted: false,
+                createdBy: {
+                    uid: user.uid,
+                    displayName: user.displayName || 'Agent',
+                    firstName: user.firstName || '',
+                    lastName: user.lastName || '',
+                    matricule: (user as any).matricule || 'N/A'
+                },
+                createdAt: serverTimestamp()
+            };
+
+            if (gedTransferSpace === 'contributor') {
+                newGedItem.contributorId = user.role === 'contributor' ? user.uid : (parentIdVal ? (existingSnap.docs.find(d => d.id === parentIdVal)?.data() as any)?.contributorId : '');
+            }
+
+            await addDoc(collection(db, 'ged_items'), newGedItem);
+            setGedTransferFile(null);
+            setStatus("Succès : Le document a été transféré dans la GED.");
+        } catch (err) {
+            console.error(err);
+            setStatus("Erreur lors du transfert.");
+        } finally {
+            setIsTransferringGed(false);
+        }
+    };
+
     const stateHandledRef = useRef(false);
     useEffect(() => {
         const state = location.state as { receiverId?: string; subject?: string; conversationId?: string; preselectUserId?: string } | null;
@@ -1618,6 +1776,8 @@ const MessagingPage = () => {
     const uploadPromisesRef = useRef<Map<number, Promise<Attachment>>>(new Map());
     const uploadTasksRef = useRef<Map<number, any>>(new Map());
 
+    const isFirstConvLoadRef = useRef(true);
+
     useEffect(() => {
         if (!user) return;
         
@@ -1648,6 +1808,23 @@ const MessagingPage = () => {
                         return tB - tA;
                     });
                 }
+
+                if (!isFirstConvLoadRef.current) {
+                    snap.docChanges().forEach(change => {
+                        if (change.type === 'added' || change.type === 'modified') {
+                            const data = change.doc.data() as Conversation;
+                            const isIncomingForMe = (user.role === 'contributor')
+                                ? !data.isReadByContributor
+                                : !data.isReadByDGI;
+                            if (isIncomingForMe) {
+                                playNotificationSound();
+                            }
+                        }
+                    });
+                } else {
+                    isFirstConvLoadRef.current = false;
+                }
+
                 setConversations(list);
             },
             (err) => handleFirestoreError(err, OperationType.LIST, 'conversations')
@@ -2053,6 +2230,99 @@ const MessagingPage = () => {
                 </div>
             </div>
 
+            {/* GED Transfer Gateway Modal */}
+            {gedTransferFile && (
+                <div className="fixed inset-0 z-[100] flex items-center justify-center bg-gray-900/60 backdrop-blur-md p-4 animate-in fade-in duration-300">
+                    <div className="bg-white rounded-[3rem] w-full max-w-md p-8 md:p-10 border border-white shadow-2xl flex flex-col relative">
+                        <header className="flex items-center gap-4 mb-6">
+                            <div className="p-3 bg-indigo-50 text-indigo-700 rounded-2xl shadow-inner">
+                                <HardDrive size={24} />
+                            </div>
+                            <div>
+                                <h3 className="text-xl font-black text-[#2C3E50] uppercase italic tracking-tight leading-none">Passerelle GED</h3>
+                                <p className="text-[9px] text-gray-400 font-bold uppercase tracking-widest mt-1">Transférer le document de conversation</p>
+                            </div>
+                        </header>
+
+                        <div className="space-y-5">
+                            <div className="space-y-1">
+                                <label className="text-[9px] font-bold text-gray-400 uppercase tracking-widest pl-1">Nom d'archivage</label>
+                                <input 
+                                    className="w-full px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl text-xs font-black shadow-inner outline-none"
+                                    value={gedTransferName}
+                                    onChange={e => setGedTransferName(e.target.value)}
+                                    placeholder="Nom du fichier"
+                                />
+                            </div>
+
+                            {user?.role !== 'contributor' && (
+                                <div className="space-y-1">
+                                    <label className="text-[9px] font-bold text-gray-400 uppercase tracking-widest pl-1">Espace GED cible</label>
+                                    <div className="grid grid-cols-2 gap-4">
+                                        <button 
+                                            onClick={() => setGedTransferSpace('private')}
+                                            className={cn(
+                                                "py-3 rounded-xl border font-black text-[9px] uppercase tracking-widest transition-all",
+                                                gedTransferSpace === 'private' ? "bg-indigo-600 border-indigo-600 text-white shadow-md shadow-indigo-600/10" : "bg-white text-gray-400 border-gray-100 hover:border-gray-200"
+                                            )}
+                                        >
+                                            Silo Privé
+                                        </button>
+                                        <button 
+                                            onClick={() => {
+                                                if (user?.restrictGedAdmin) return;
+                                                setGedTransferSpace('administrative');
+                                            }}
+                                            disabled={user?.restrictGedAdmin}
+                                            className={cn(
+                                                "py-3 rounded-xl border font-black text-[9px] uppercase tracking-widest transition-all",
+                                                gedTransferSpace === 'administrative' ? "bg-indigo-600 border-indigo-600 text-white shadow-md shadow-indigo-600/10" : "bg-white text-gray-400 border-gray-100 hover:border-gray-200",
+                                                user?.restrictGedAdmin && "opacity-55 cursor-not-allowed"
+                                            )}
+                                        >
+                                            Espace Admin
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            <div className="space-y-1">
+                                <label className="text-[9px] font-bold text-gray-400 uppercase tracking-widest pl-1">Répertoire de destination</label>
+                                <select 
+                                    className="w-full px-5 py-3.5 bg-gray-50 border border-gray-100 rounded-2xl text-xs font-black shadow-inner outline-none"
+                                    value={gedTransferFolder}
+                                    onChange={e => setGedTransferFolder(e.target.value)}
+                                >
+                                    <option value="root">/ (Dossier Racine)</option>
+                                    {gedTransferFolders.map(folder => (
+                                        <option key={folder.id} value={folder.id}>
+                                            / {folder.name}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            <div className="flex gap-4 pt-4">
+                                <button 
+                                    onClick={() => setGedTransferFile(null)}
+                                    className="flex-1 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest"
+                                    disabled={isTransferringGed}
+                                >
+                                    Annuler
+                                </button>
+                                <button 
+                                    onClick={handleConfirmGedTransfer}
+                                    className="flex-1 py-4 bg-indigo-600 text-white rounded-2xl font-black text-[10px] uppercase tracking-widest shadow-xl shadow-indigo-600/20 hover:brightness-110 active:scale-95 transition-all"
+                                    disabled={isTransferringGed}
+                                >
+                                    {isTransferringGed ? 'Transfert...' : 'Enregistrer'}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Compose Modal */}
             {isComposeOpen && (
                 <div className="fixed inset-0 z-[60] flex items-center justify-center bg-gray-900/60 backdrop-blur-md p-4 animate-in fade-in duration-300">
@@ -2423,6 +2693,12 @@ const MessagingPage = () => {
                                                                             <Download size={14} />
                                                                         </a>
                                                                     </div>
+                                                                    <button 
+                                                                        onClick={() => setGedTransferFile(att)}
+                                                                        className="w-full flex items-center justify-center gap-2 py-2.5 bg-indigo-50 border border-indigo-100 hover:bg-indigo-100 text-[#4F46E5] text-[8px] font-black uppercase tracking-widest rounded-xl transition-all"
+                                                                    >
+                                                                        <HardDrive size={11} /> Sauvegarder dans la GED
+                                                                    </button>
                                                                 </div>
                                                             );
                                                         })}
@@ -2634,7 +2910,8 @@ const SettingsPage = () => {
         phone: '',
         tempPassword: 'Dgi2026!',
         role: 'agent' as UserRole,
-        permissions: [] as AgentPermission[]
+        permissions: [] as AgentPermission[],
+        matricule: ''
     });
 
     useEffect(() => {
@@ -2676,17 +2953,25 @@ const SettingsPage = () => {
 
     const handleCreateAgent = async () => {
         if (!agentForm.email.trim() || !user) return;
+        if (!agentForm.matricule?.trim()) {
+            alert("Erreur : Le champ MATRICULE est obligatoire pour créer un agent.");
+            return;
+        }
         setLoading(true);
         try {
             const tempPass = agentForm.tempPassword || 'Dgi2026!';
             const displayName = `${agentForm.firstName} ${agentForm.lastName}`.trim();
+            const mat = agentForm.matricule.trim();
             
             const newUser: Partial<AppUser> = {
                 email: agentForm.email.toLowerCase().trim(),
                 displayName: displayName || 'Nouvel Agent',
+                firstName: agentForm.firstName.trim(),
+                lastName: agentForm.lastName.trim(),
                 phone: agentForm.phone,
                 role: agentForm.role,
                 permissions: agentForm.permissions,
+                matricule: mat,
                 isActive: true, // "active: true" mapped to isActive
                 isFirstLogin: true,
                 isNew: true, // Requested field
@@ -2703,12 +2988,15 @@ const SettingsPage = () => {
                 email: newUser.email,
                 role: newUser.role,
                 displayName: newUser.displayName,
+                firstName: newUser.firstName,
+                lastName: newUser.lastName,
                 uid: agentRef.id,
                 password: tempPass,
-                isNew: true
+                isNew: true,
+                matricule: mat
             });
             
-            setAgentForm({ firstName: '', lastName: '', email: '', phone: '', tempPassword: 'Dgi2026!', role: 'agent', permissions: [] });
+            setAgentForm({ firstName: '', lastName: '', email: '', phone: '', tempPassword: 'Dgi2026!', role: 'agent', permissions: [], matricule: '' });
             setStatus(`Profil Agent créé : ${agentForm.email}. Code d'activation temporaire: ${tempPass}.`);
         } catch (e) {
             console.error(e);
@@ -2735,11 +3023,23 @@ const SettingsPage = () => {
             let password = '';
             let isNew = true;
             let permissions: AgentPermission[] = agent.permissions || [];
+            let matricule = agent.matricule || '';
+            let firstName = agent.firstName || '';
+            let lastName = agent.lastName || '';
+            
+            if (!firstName && !lastName && agent.displayName) {
+                const parts = agent.displayName.split(' ');
+                firstName = parts[0] || '';
+                lastName = parts.slice(1).join(' ') || '';
+            }
             
             if (!agentSnap.empty) {
                 const data = agentSnap.docs[0].data();
                 password = data.password || '';
                 isNew = data.isNew !== false;
+                if (!matricule && data.matricule) matricule = data.matricule;
+                if (!firstName && data.firstName) firstName = data.firstName;
+                if (!lastName && data.lastName) lastName = data.lastName;
                 if (data.permissions) {
                     permissions = data.permissions;
                 }
@@ -2750,6 +3050,9 @@ const SettingsPage = () => {
 
             setEditingAgent({
                 ...agent,
+                firstName,
+                lastName,
+                matricule,
                 permissions,
                 internalPassword: password,
                 isNew: isNew
@@ -2758,8 +3061,18 @@ const SettingsPage = () => {
             setEditAgentIsNew(isNew);
         } catch (e) {
             console.error("Error opening edit agent info:", e);
+            let fName = agent.firstName || '';
+            let lName = agent.lastName || '';
+            if (!fName && !lName && agent.displayName) {
+                const parts = agent.displayName.split(' ');
+                fName = parts[0] || '';
+                lName = parts.slice(1).join(' ') || '';
+            }
             setEditingAgent({
                 ...agent,
+                firstName: fName,
+                lastName: lName,
+                matricule: agent.matricule || '',
                 permissions: agent.permissions || [],
                 internalPassword: agent.internalPassword || 'Dgi2026!',
                 isNew: agent.isNew !== false
@@ -2828,13 +3141,24 @@ const SettingsPage = () => {
             const isPasswordChanged = editAgentPassword !== editingAgent.internalPassword;
             const finalIsNew = isPasswordChanged ? true : editAgentIsNew;
 
+            const updatedFirstName = (editingAgent.firstName || '').trim();
+            const updatedLastName = (editingAgent.lastName || '').trim();
+            const updatedDisplayName = `${updatedFirstName} ${updatedLastName}`.trim() || editingAgent.displayName || 'Agent';
+            const updatedPhone = (editingAgent.phone || '').trim();
+            const updatedMatricule = (editingAgent.matricule || '').trim();
+
             const userDocRef = doc(db, 'users', editingAgent.uid);
             await updateDoc(userDocRef, {
                 role: editingAgent.role,
                 permissions: editingAgent.permissions || [],
                 internalPassword: editAgentPassword,
                 isNew: finalIsNew,
-                isActive: editingAgent.isActive !== false
+                isActive: editingAgent.isActive !== false,
+                firstName: updatedFirstName,
+                lastName: updatedLastName,
+                displayName: updatedDisplayName,
+                phone: updatedPhone,
+                matricule: updatedMatricule
             });
 
             const agentsRef = collection(db, 'agents');
@@ -2847,17 +3171,25 @@ const SettingsPage = () => {
                     permissions: editingAgent.permissions || [],
                     password: editAgentPassword,
                     isNew: finalIsNew,
-                    displayName: editingAgent.displayName
+                    displayName: updatedDisplayName,
+                    firstName: updatedFirstName,
+                    lastName: updatedLastName,
+                    phone: updatedPhone,
+                    matricule: updatedMatricule
                 });
             } else {
                 await setDoc(doc(db, 'agents', editingAgent.uid), {
                     email: editingAgent.email.toLowerCase().trim(),
                     role: editingAgent.role,
-                    displayName: editingAgent.displayName,
+                    displayName: updatedDisplayName,
+                    firstName: updatedFirstName,
+                    lastName: updatedLastName,
                     uid: editingAgent.uid,
                     password: editAgentPassword,
                     isNew: finalIsNew,
-                    permissions: editingAgent.permissions || []
+                    permissions: editingAgent.permissions || [],
+                    phone: updatedPhone,
+                    matricule: updatedMatricule
                 });
             }
 
@@ -3262,6 +3594,15 @@ const SettingsPage = () => {
                                             onChange={e => setAgentForm(p => ({ ...p, tempPassword: e.target.value }))}
                                         />
                                     </div>
+                                    <div className="space-y-2">
+                                        <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest pl-1">Matricule <span className="text-red-500 font-bold">*</span></label>
+                                        <input 
+                                            placeholder="Ex: AG-2026-987" 
+                                            className="w-full px-6 py-4 bg-white border border-gray-200 rounded-2xl text-sm font-black outline-none focus:ring-4 focus:ring-primary/5 transition-all shadow-sm text-cyan-800 bg-cyan-50/20"
+                                            value={agentForm.matricule}
+                                            onChange={e => setAgentForm(p => ({ ...p, matricule: e.target.value }))}
+                                        />
+                                    </div>
                                     <div className="space-y-2 lg:col-span-1">
                                         <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest pl-1">Périmètre de Responsabilité</label>
                                         <div className="flex gap-4">
@@ -3452,9 +3793,65 @@ const SettingsPage = () => {
                                 <Settings size={40} />
                             </div>
                             <h2 className="text-2xl font-black text-[#2C3E50] text-[#2C3E50] text-center mb-1 italic uppercase tracking-tight">Habilitation & Droits</h2>
-                            <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest text-center mb-10">{editingAgent.email}</p>
+                            <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest text-center mb-6">{editingAgent.email}</p>
 
                             <div className="space-y-6">
+                                {/* Informations Agent de la DGI */}
+                                <div className="space-y-4 p-5 bg-gray-50 border border-gray-100 rounded-3xl">
+                                    <h3 className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Informations Identité</h3>
+                                    
+                                    <div className="grid grid-cols-2 gap-4">
+                                        <div className="space-y-1">
+                                            <label className="text-[9px] font-bold text-gray-400 uppercase tracking-wide">Prénom</label>
+                                            <input 
+                                                type="text"
+                                                className="w-full px-4 py-3 bg-white border border-gray-200 rounded-xl text-xs font-black outline-none focus:ring-4 focus:ring-primary/5 transition-all shadow-sm"
+                                                value={editingAgent.firstName || ''}
+                                                onChange={e => setEditingAgent(p => p ? { ...p, firstName: e.target.value } : null)}
+                                            />
+                                        </div>
+                                        <div className="space-y-1">
+                                            <label className="text-[9px] font-bold text-gray-400 uppercase tracking-wide">Nom (Patronyme)</label>
+                                            <input 
+                                                type="text"
+                                                className="w-full px-4 py-3 bg-white border border-gray-200 rounded-xl text-xs font-black outline-none focus:ring-4 focus:ring-primary/5 transition-all shadow-sm"
+                                                value={editingAgent.lastName || ''}
+                                                onChange={e => setEditingAgent(p => p ? { ...p, lastName: e.target.value } : null)}
+                                            />
+                                        </div>
+                                    </div>
+
+                                    <div className="grid grid-cols-2 gap-4">
+                                        <div className="space-y-1">
+                                            <label className="text-[9px] font-bold text-gray-400 uppercase tracking-wide">Téléphone</label>
+                                            <input 
+                                                type="text"
+                                                className="w-full px-4 py-3 bg-white border border-gray-200 rounded-xl text-xs font-black outline-none focus:ring-4 focus:ring-primary/5 transition-all shadow-sm"
+                                                value={editingAgent.phone || ''}
+                                                onChange={e => setEditingAgent(p => p ? { ...p, phone: e.target.value } : null)}
+                                            />
+                                        </div>
+                                        <div className="space-y-1">
+                                            <label className="text-[9px] font-bold text-gray-400 uppercase tracking-wide">Matricule</label>
+                                            <input 
+                                                type="text"
+                                                className="w-full px-4 py-3 bg-white border border-gray-200 rounded-xl text-xs font-black outline-none focus:ring-4 focus:ring-primary/5 transition-all shadow-sm font-mono text-cyan-800"
+                                                value={editingAgent.matricule || ''}
+                                                onChange={e => setEditingAgent(p => p ? { ...p, matricule: e.target.value } : null)}
+                                            />
+                                        </div>
+                                    </div>
+
+                                    <div className="space-y-1">
+                                        <label className="text-[9px] font-bold text-gray-400 uppercase tracking-wide">Adresse E-mail Google Professionnel (Sécurisé)</label>
+                                        <input 
+                                            type="text"
+                                            disabled
+                                            className="w-full px-4 py-3 bg-gray-100 border border-gray-200 rounded-xl text-xs font-black text-gray-400 cursor-not-allowed outline-none select-none"
+                                            value={editingAgent.email}
+                                        />
+                                    </div>
+                                </div>
                                 {/* Périmètre de responsabilité */}
                                 <div className="space-y-3">
                                     <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Périmètre de Responsabilité</label>
@@ -4742,12 +5139,29 @@ const DirectoryPage = () => {
                                                             <button 
                                                                 onClick={async () => {
                                                                     if (confirm("Détacher ce gestionnaire et remettre le dossier en canal public ?")) {
-                                                                        await updateDoc(doc(db, 'users', selectedUser.uid), {
-                                                                            assignedAgentId: null,
-                                                                            assignedAgentName: null
-                                                                        });
-                                                                        setSelectedUser(null);
-                                                                        setStatus("Gestionnaire détaché. Dossier libre.");
+                                                                        try {
+                                                                            await updateDoc(doc(db, 'users', selectedUser.uid), {
+                                                                                assignedAgentId: null,
+                                                                                assignedAgentName: null,
+                                                                                assignedAgentEmail: null
+                                                                            });
+                                                                            const convsSnap = await getDocs(query(
+                                                                                collection(db, 'conversations'),
+                                                                                where('contributorId', '==', selectedUser.uid)
+                                                                            ));
+                                                                            for (const convDoc of convsSnap.docs) {
+                                                                                await updateDoc(convDoc.ref, {
+                                                                                    assignedAgentId: null,
+                                                                                    assignedAgentEmail: null,
+                                                                                    assignedAgentName: null
+                                                                                });
+                                                                            }
+                                                                            setSelectedUser(null);
+                                                                            setStatus("Détaché avec succès du contribuable et des conversations.");
+                                                                        } catch (err) {
+                                                                            console.error(err);
+                                                                            setStatus("Erreur détachement");
+                                                                        }
                                                                     }
                                                                 }}
                                                                 className="p-2 bg-red-50 text-red-600 rounded-lg hover:bg-red-100 transition-all shadow-sm"
@@ -4960,6 +5374,136 @@ const InternalChatPage = () => {
     const [searchAgent, setSearchAgent] = useState('');
     const [activeTab, setActiveTab] = useState<'public' | 'private'>('public');
     const [uploadProgress, setUploadProgress] = useState<number[]>([]);
+
+    // GED Transfer Gateway State
+    const [gedTransferFile, setGedTransferFile] = useState<any | null>(null);
+    const [gedTransferSpace, setGedTransferSpace] = useState<'private' | 'administrative' | 'contributor'>('private');
+    const [gedTransferFolder, setGedTransferFolder] = useState<string>('root');
+    const [gedTransferFolders, setGedTransferFolders] = useState<any[]>([]);
+    const [isTransferringGed, setIsTransferringGed] = useState<boolean>(false);
+    const [gedTransferName, setGedTransferName] = useState<string>('');
+
+    useEffect(() => {
+        if (!gedTransferFile) return;
+        setGedTransferName(gedTransferFile.name);
+        if (user?.role === 'contributor') {
+            setGedTransferSpace('contributor');
+        } else {
+            setGedTransferSpace('private');
+        }
+    }, [gedTransferFile, user]);
+
+    useEffect(() => {
+        if (!gedTransferFile || !user) return;
+        let q = query(
+            collection(db, 'ged_items'), 
+            where('type', '==', 'folder'),
+            where('space', '==', gedTransferSpace),
+            where('isDeleted', '==', false)
+        );
+        if (gedTransferSpace === 'private') {
+            q = query(
+                collection(db, 'ged_items'), 
+                where('type', '==', 'folder'),
+                where('space', '==', 'private'),
+                where('ownerId', '==', user.uid),
+                where('isDeleted', '==', false)
+            );
+        } else if (gedTransferSpace === 'contributor' && user.role === 'contributor') {
+            q = query(
+                collection(db, 'ged_items'), 
+                where('type', '==', 'folder'),
+                where('space', '==', 'contributor'),
+                where('contributorId', '==', user.uid),
+                where('isDeleted', '==', false)
+            );
+        }
+        
+        getDocs(q).then((snap) => {
+            setGedTransferFolders(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+        }).catch(err => {
+            console.error(err);
+        });
+    }, [gedTransferFile, gedTransferSpace, user]);
+
+    const handleConfirmGedTransfer = async () => {
+        if (!gedTransferFile || !user) return;
+        setIsTransferringGed(true);
+        try {
+            const parentIdVal = gedTransferFolder === 'root' ? null : gedTransferFolder;
+            const existingQ = query(
+                collection(db, 'ged_items'),
+                where('space', '==', gedTransferSpace),
+                where('parentId', '==', parentIdVal),
+                where('isDeleted', '==', false)
+            );
+            const existingSnap = await getDocs(existingQ);
+            const existingNames = existingSnap.docs.map(d => (d.data() as any).name);
+            
+            const helperUniqueName = (proposed: string, list: string[]): string => {
+                if (!list.map(n => n.toLowerCase()).includes(proposed.toLowerCase())) return proposed;
+                let bName = proposed;
+                let ext = '';
+                const lastDotIdx = proposed.lastIndexOf('.');
+                if (lastDotIdx !== -1 && lastDotIdx > 0) {
+                    bName = proposed.substring(0, lastDotIdx);
+                    ext = proposed.substring(lastDotIdx);
+                }
+                let cand = '';
+                if (bName.endsWith('-copie')) {
+                    cand = `${bName}-1${ext}`;
+                } else if (/-copie-(\d+)$/.test(bName)) {
+                    const match = bName.match(/-copie-(\d+)$/);
+                    const num = parseInt(match![1]) + 1;
+                    cand = `${bName.replace(/-copie-\d+$/, `-copie-${num}`)}${ext}`;
+                } else if (/\d+$/.test(bName)) {
+                    const match = bName.match(/(\d+)$/);
+                    const num = parseInt(match![1]) + 1;
+                    cand = `${bName.replace(/\d+$/, String(num))}${ext}`;
+                } else {
+                    cand = ext ? `${bName}-copie${ext}` : `${bName}-2`;
+                }
+                return helperUniqueName(cand, list);
+            };
+
+            const finalUniqueName = helperUniqueName(gedTransferName.trim() || gedTransferFile.name, existingNames);
+            const fileExtension = finalUniqueName.split('.').pop()?.toLowerCase() || 'bin';
+
+            const newGedItem: any = {
+                name: finalUniqueName,
+                type: 'file',
+                parentId: parentIdVal,
+                space: gedTransferSpace,
+                ownerId: user.uid,
+                ownerEmail: user.email,
+                extension: fileExtension,
+                fileUrl: gedTransferFile.url,
+                fileSize: 0,
+                isDeleted: false,
+                createdBy: {
+                    uid: user.uid,
+                    displayName: user.displayName || 'Agent',
+                    firstName: user.firstName || '',
+                    lastName: user.lastName || '',
+                    matricule: (user as any).matricule || 'N/A'
+                },
+                createdAt: serverTimestamp()
+            };
+
+            if (gedTransferSpace === 'contributor') {
+                newGedItem.contributorId = user.role === 'contributor' ? user.uid : (parentIdVal ? (existingSnap.docs.find(d => d.id === parentIdVal)?.data() as any)?.contributorId : '');
+            }
+
+            await addDoc(collection(db, 'ged_items'), newGedItem);
+            setGedTransferFile(null);
+            alert(`Document sauvegardé avec succès dans votre espace GED sous le nom : "${finalUniqueName}" !`);
+        } catch (err) {
+            console.error(err);
+            alert("Erreur lors du transfert.");
+        } finally {
+            setIsTransferringGed(false);
+        }
+    };
 
     const handleInternalFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const files = Array.from(e.target.files || []) as File[];
@@ -5458,28 +6002,35 @@ const InternalChatPage = () => {
                                         {m.attachments?.map((at, idx) => {
                                             const isImg = at.type?.startsWith('image/');
                                             return (
-                                                <a 
-                                                    key={idx} 
-                                                    href={at.url} 
-                                                    target="_blank" 
-                                                    rel="noopener noreferrer"
-                                                    className="mt-4 p-4 bg-white border border-gray-100 rounded-2xl flex items-center gap-4 shadow-sm hover:border-primary/30 transition-all group/at"
-                                                >
-                                                    <div className="w-10 h-10 bg-gray-50 rounded-xl flex items-center justify-center shrink-0 shadow-inner overflow-hidden border border-gray-100">
-                                                        {isImg ? (
-                                                            <img src={at.url} className="w-full h-full object-cover" alt="Preview" referrerPolicy="no-referrer" />
-                                                        ) : (
-                                                            <FileText size={18} className="text-primary" />
-                                                        )}
-                                                    </div>
-                                                    <div className="flex-1 min-w-0">
-                                                        <div className="flex items-center justify-between gap-2 overflow-hidden">
-                                                            <p className="text-[9px] font-black text-[#2C3E50] truncate">{at.name}</p>
-                                                            <Download size={10} className="text-primary opacity-30 group-hover/at:opacity-100 transition-opacity" />
+                                                <div key={idx} className="relative mt-4">
+                                                    <a 
+                                                        href={at.url} 
+                                                        target="_blank" 
+                                                        rel="noopener noreferrer"
+                                                        className="p-4 bg-white border border-gray-100 rounded-2xl rounded-b-none border-b-0 flex items-center gap-4 shadow-sm hover:border-primary/30 transition-all group/at"
+                                                    >
+                                                        <div className="w-10 h-10 bg-gray-50 rounded-xl flex items-center justify-center shrink-0 shadow-inner overflow-hidden border border-gray-100">
+                                                            {isImg ? (
+                                                                <img src={at.url} className="w-full h-full object-cover" alt="Preview" referrerPolicy="no-referrer" />
+                                                            ) : (
+                                                                <FileText size={18} className="text-primary" />
+                                                            )}
                                                         </div>
-                                                        <p className="text-[7px] text-gray-400 font-bold uppercase tracking-widest">{at.type?.split('/')[1]?.toUpperCase() || 'DOCUMENT'}</p>
-                                                    </div>
-                                                </a>
+                                                        <div className="flex-1 min-w-0">
+                                                            <div className="flex items-center justify-between gap-2 overflow-hidden">
+                                                                <p className="text-[9px] font-black text-[#2C3E50] truncate">{at.name}</p>
+                                                                <Download size={10} className="text-primary opacity-30 group-hover/at:opacity-100 transition-opacity" />
+                                                            </div>
+                                                            <p className="text-[7px] text-gray-400 font-bold uppercase tracking-widest">{at.type?.split('/')[1]?.toUpperCase() || 'DOCUMENT'}</p>
+                                                        </div>
+                                                    </a>
+                                                    <button 
+                                                        onClick={() => setGedTransferFile(at)}
+                                                        className="w-full py-2 bg-indigo-50 border border-indigo-150 border-t-0 rounded-b-2xl text-[8px] font-black uppercase text-indigo-700 hover:bg-indigo-100 hover:text-indigo-800 tracking-wider flex items-center justify-center gap-1 shadow-sm transition-colors"
+                                                    >
+                                                        <HardDrive size={10} /> Enregistrer dans la GED
+                                                    </button>
+                                                </div>
                                             );
                                         })}
                                         <p className={cn("text-[8px] font-black uppercase tracking-widest mt-4 opacity-30", m.senderId === user.uid ? "text-right" : "text-left")}>
@@ -5566,6 +6117,97 @@ const InternalChatPage = () => {
                                 message="Voulez-vous supprimer ce message ? Les pièces jointes seront également effacées définitivement."
                             />
                         </footer>
+
+                        {/* GED Transfer Gateway Modal */}
+                        {gedTransferFile && (
+                            <div className="fixed inset-0 z-[200] flex items-center justify-center bg-gray-900/60 backdrop-blur-md p-4 animate-in fade-in duration-300">
+                                <div className="bg-white rounded-[3rem] w-full max-w-md p-8 md:p-10 border border-white shadow-2xl flex flex-col relative text-left">
+                                    <header className="flex items-center gap-4 mb-6">
+                                        <div className="p-3 bg-indigo-50 text-indigo-700 rounded-2xl shadow-inner animate-pulse">
+                                            <HardDrive size={24} />
+                                        </div>
+                                        <div>
+                                            <h3 className="text-xl font-black text-[#2C3E50] uppercase italic tracking-tight leading-none">Passerelle GED Staff</h3>
+                                            <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest mt-1">Transférer le document de conversation</p>
+                                        </div>
+                                    </header>
+
+                                    <div className="space-y-5">
+                                        <div className="space-y-1">
+                                            <label className="text-[9px] font-bold text-gray-400 uppercase tracking-widest pl-1">Nom d'archivage</label>
+                                            <input 
+                                                className="w-full px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl text-xs font-black shadow-inner outline-none"
+                                                value={gedTransferName}
+                                                onChange={e => setGedTransferName(e.target.value)}
+                                                placeholder="Nom du fichier"
+                                            />
+                                        </div>
+
+                                        <div className="space-y-1">
+                                            <label className="text-[9px] font-bold text-gray-400 uppercase tracking-widest pl-1">Espace GED cible</label>
+                                            <div className="grid grid-cols-2 gap-4">
+                                                <button 
+                                                    onClick={() => setGedTransferSpace('private')}
+                                                    className={cn(
+                                                        "py-3 rounded-xl border font-black text-[9px] uppercase tracking-widest transition-all",
+                                                        gedTransferSpace === 'private' ? "bg-indigo-600 border-indigo-600 text-white shadow-md shadow-indigo-600/10" : "bg-white text-gray-400 border-gray-100 hover:border-gray-200"
+                                                    )}
+                                                >
+                                                    Silo Privé
+                                                </button>
+                                                <button 
+                                                    onClick={() => {
+                                                        if (user?.restrictGedAdmin) return;
+                                                        setGedTransferSpace('administrative');
+                                                    }}
+                                                    disabled={user?.restrictGedAdmin}
+                                                    className={cn(
+                                                        "py-3 rounded-xl border font-black text-[9px] uppercase tracking-widest transition-all",
+                                                        gedTransferSpace === 'administrative' ? "bg-indigo-600 border-indigo-600 text-white shadow-md shadow-indigo-600/10" : "bg-white text-gray-400 border-gray-100 hover:border-gray-200",
+                                                        user?.restrictGedAdmin && "opacity-55 cursor-not-allowed"
+                                                    )}
+                                                >
+                                                    Espace Admin
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        <div className="space-y-1">
+                                            <label className="text-[9px] font-bold text-gray-400 uppercase tracking-widest pl-1">Répertoire de destination</label>
+                                            <select 
+                                                className="w-full px-5 py-3.5 bg-gray-50 border border-gray-105 rounded-xl text-xs font-black outline-none"
+                                                value={gedTransferFolder}
+                                                onChange={e => setGedTransferFolder(e.target.value)}
+                                            >
+                                                <option value="root">/ (Dossier Racine)</option>
+                                                {gedTransferFolders.map(folder => (
+                                                    <option key={folder.id} value={folder.id}>
+                                                        / {folder.name}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        </div>
+
+                                        <div className="flex gap-4 pt-4">
+                                            <button 
+                                                onClick={() => setGedTransferFile(null)}
+                                                className="flex-1 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest"
+                                                disabled={isTransferringGed}
+                                            >
+                                                Annuler
+                                            </button>
+                                            <button 
+                                                onClick={handleConfirmGedTransfer}
+                                                className="flex-1 py-4 bg-indigo-600 text-white rounded-2xl font-black text-[10px] uppercase tracking-widest shadow-xl shadow-indigo-600/20 hover:brightness-110 active:scale-95 transition-all"
+                                                disabled={isTransferringGed}
+                                            >
+                                                {isTransferringGed ? 'Transfert...' : 'Enregistrer'}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
 
                         <Dialog.Root open={isNewDiscussionOpen} onOpenChange={setIsNewDiscussionOpen}>
                             <Dialog.Portal>
@@ -6015,6 +6657,7 @@ const MainContent = () => {
                 <Route path="/" element={user.role !== 'contributor' && isAdminMode ? <Navigate to="/admin" /> : <DashboardPage />} />
                 <Route path="/admin" element={<AdminGuard><DashboardPage /></AdminGuard>} />
                 <Route path="/messaging" element={<MessagingPage />} />
+                <Route path="/ged" element={<GedPage />} />
                 <Route path="/account" element={<AccountPage />} />
                 {(user.role === 'admin' || user.role === 'agent') && (
                     <>

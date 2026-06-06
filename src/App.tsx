@@ -410,23 +410,30 @@ function updateFavicon(url: string) {
 
 const ThemeProvider = ({ children }: { children: React.ReactNode }) => {
   const [theme, setTheme] = useState<ThemeConfig>(() => {
-    // Étape 1 : Au démarrage de l'application, vérification du stockage local
+    // Étape 1 : Au tout premier démarrage de l'application, cherche les valeurs directement dans dgi_branding_config
+    const localConfig = localStorage.getItem('dgi_branding_config');
     const savedBranding = localStorage.getItem('dgi_branding');
     const savedTheme = localStorage.getItem('dgi_theme');
     
     let baseTheme = DEFAULT_THEME;
-    if (savedBranding) {
-        try {
-            baseTheme = { ...DEFAULT_THEME, ...JSON.parse(savedBranding) };
-        } catch (e) {
-            // fallback if failed to parse
-        }
+    if (localConfig) {
+      try {
+        baseTheme = { ...DEFAULT_THEME, ...JSON.parse(localConfig) };
+      } catch (e) {
+        // Fallback en cas d'erreur de parsing
+      }
+    } else if (savedBranding) {
+      try {
+        baseTheme = { ...DEFAULT_THEME, ...JSON.parse(savedBranding) };
+      } catch (e) {
+        // Fallback en cas d'erreur de parsing
+      }
     } else if (savedTheme) {
-        try {
-            baseTheme = { ...DEFAULT_THEME, ...JSON.parse(savedTheme) };
-        } catch(e) {
-            baseTheme = DEFAULT_THEME;
-        }
+      try {
+        baseTheme = { ...DEFAULT_THEME, ...JSON.parse(savedTheme) };
+      } catch(e) {
+        baseTheme = DEFAULT_THEME;
+      }
     }
 
     // --- INITIAL MODE DETECTION ---
@@ -456,52 +463,86 @@ const ThemeProvider = ({ children }: { children: React.ReactNode }) => {
   });
 
   useEffect(() => {
-    // Étape 2 : Lancement de l'écouteur Firestore en parallèle
-    const unsub = onSnapshot(doc(db, 'settings', 'branding'), (snap) => {
-      if (snap.exists()) {
-        const data = snap.data() as ThemeConfig;
-        
-        // Sauvegarde immédiate dans le stockage local pour persistance
-        localStorage.setItem('dgi_branding', JSON.stringify(data));
-        
-        setTheme(prev => {
-          if (data.updatedAt && prev.updatedAt && data.updatedAt < prev.updatedAt) {
-            return prev;
-          }
-          const merged = { ...prev, ...data };
+    // Étape 2 : Lancement silencieux de l'écouteur Firestore
+    let unsub = () => {};
+    try {
+      unsub = onSnapshot(doc(db, 'settings', 'branding'), (snap) => {
+        if (snap.exists()) {
+          const data = snap.data() as ThemeConfig;
           
-          const params = new URLSearchParams(window.location.search);
-          const modeParam = params.get('mode') || params.get('simu');
-          const isDGIMode = modeParam === 'dgi_echange' || modeParam === 'dgi_exchange' || localStorage.getItem('dgi_mode') === 'true';
-          
-          if (isDGIMode) {
-             return {
-               ...merged,
-               primary: '#1E3A8A',
-               secondary: '#F1F5F9',
-               borderRadius: 8,
-               cardShadow: 'sm',
-               componentPadding: 'compact',
-               appName: 'DGI ÉCHANGE',
-               appTitle: 'Plateforme Nationale d\'Échange - DGI RDC',
-               welcomeMessage: 'Simulation du système DGI Échange. Ce portail centralise les communications entre la Direction Générale des Impôts et les opérateurs économiques.',
-               supportEmail: 'contact.echange@dgi.gouv.cd',
-               footerText: '© 2026 République Démocratique du Congo - Direction Générale des Impôts',
-               logoUrl: 'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/Coat_of_arms_of_the_Democratic_Republic_of_the_Congo.svg/200px-Coat_of_arms_of_the_Democratic_Republic_of_the_Congo.svg.png'
-             };
+          // Récupère la configuration stockée en local pour comparaison
+          const currentLocalRaw = localStorage.getItem('dgi_branding_config');
+          let shouldUpdateAndOverwrite = false;
+
+          if (!currentLocalRaw) {
+            shouldUpdateAndOverwrite = true;
+          } else {
+            try {
+              const currentLocalParsed = JSON.parse(currentLocalRaw);
+              const fieldsToCompare: (keyof ThemeConfig)[] = [
+                'primary', 'secondary', 'font', 'logoUrl', 'faviconUrl', 
+                'borderRadius', 'cardShadow', 'componentPadding', 
+                'appName', 'appTitle', 'welcomeMessage', 'supportEmail', 'footerText'
+              ];
+              const isDifferent = fieldsToCompare.some(field => currentLocalParsed[field] !== data[field]);
+              if (isDifferent) {
+                shouldUpdateAndOverwrite = true;
+              }
+            } catch (err) {
+              shouldUpdateAndOverwrite = true;
+            }
           }
 
-          localStorage.setItem('dgi_theme', JSON.stringify(merged));
-          if (data.faviconUrl) {
-            updateFavicon(data.faviconUrl);
+          if (shouldUpdateAndOverwrite) {
+            // Sauvegarde immédiate dans localStorage pour persistance absolue (anti-flash)
+            localStorage.setItem('dgi_branding_config', JSON.stringify(data));
+            localStorage.setItem('dgi_branding', JSON.stringify(data));
+            
+            setTheme(prev => {
+              if (data.updatedAt && prev.updatedAt && data.updatedAt < prev.updatedAt) {
+                return prev;
+              }
+              const merged = { ...prev, ...data };
+              
+              const params = new URLSearchParams(window.location.search);
+              const modeParam = params.get('mode') || params.get('simu');
+              const isDGIMode = modeParam === 'dgi_echange' || modeParam === 'dgi_exchange' || localStorage.getItem('dgi_mode') === 'true';
+              
+              if (isDGIMode) {
+                 return {
+                   ...merged,
+                   primary: '#1E3A8A',
+                   secondary: '#F1F5F9',
+                   borderRadius: 8,
+                   cardShadow: 'sm',
+                   componentPadding: 'compact',
+                   appName: 'DGI ÉCHANGE',
+                   appTitle: 'Plateforme Nationale d\'Échange - DGI RDC',
+                   welcomeMessage: 'Simulation du système DGI Échange. Ce portail centralise les communications entre la Direction Générale des Impôts et les opérateurs économiques.',
+                   supportEmail: 'contact.echange@dgi.gouv.cd',
+                   footerText: '© 2026 République Démocratique du Congo - Direction Générale des Impôts',
+                   logoUrl: 'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/Coat_of_arms_of_the_Democratic_Republic_of_the_Congo.svg/200px-Coat_of_arms_of_the_Democratic_Republic_of_the_Congo.svg.png'
+                 };
+              }
+
+              localStorage.setItem('dgi_theme', JSON.stringify(merged));
+              if (data.faviconUrl) {
+                updateFavicon(data.faviconUrl);
+              }
+              return merged;
+            });
           }
-          return merged;
-        });
-      } else {
-        const initData = { ...DEFAULT_THEME, updatedAt: Date.now() };
-        setDoc(doc(db, 'settings', 'branding'), initData);
-      }
-    }, (err) => handleFirestoreError(err, OperationType.GET, 'settings/branding'));
+        } else {
+          const initData = { ...DEFAULT_THEME, updatedAt: Date.now() };
+          setDoc(doc(db, 'settings', 'branding'), initData).catch(e => console.error(e));
+        }
+      }, (err) => {
+        // En cas d'erreur de connexion/réseau, on maintient strictement les données du local sans jamais réinitialiser
+        handleFirestoreError(err, OperationType.GET, 'settings/branding');
+      });
+    } catch (e) {
+      console.error("Failed to register onSnapshot for branding settings:", e);
+    }
     return () => unsub();
   }, []);
 
@@ -545,6 +586,8 @@ const ThemeProvider = ({ children }: { children: React.ReactNode }) => {
     setTheme(prev => {
       const updated = { ...prev, ...updatePatch };
       localStorage.setItem('dgi_theme', JSON.stringify(updated));
+      localStorage.setItem('dgi_branding_config', JSON.stringify(updated));
+      localStorage.setItem('dgi_branding', JSON.stringify(updated));
       return updated;
     });
 
@@ -2900,6 +2943,7 @@ const SettingsPage = () => {
     const navigate = useNavigate();
     const [status, setStatus] = useState('');
     const [agents, setAgents] = useState<AppUser[]>([]);
+    const [agentTab, setAgentTab] = useState<'active' | 'trash'>('active');
     const [uploading, setUploading] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
     
@@ -3205,16 +3249,51 @@ const SettingsPage = () => {
     };
 
     const toggleAgentStatus = async (agent: AppUser) => {
+        const nextActive = !agent.isActive;
         await updateDoc(doc(db, 'users', agent.uid), {
-            isActive: !agent.isActive
+            isActive: nextActive,
+            status: nextActive ? 'active' : 'suspended'
+        });
+        await updateDoc(doc(db, 'agents', agent.uid), {
+            isActive: nextActive,
+            status: nextActive ? 'active' : 'suspended'
         });
     };
 
     const deleteAgent = async (agentId: string) => {
-        if (confirm('Supprimer définitivement cet agent ?')) {
+        if (confirm('Voulez-vous suspendre cet agent et l\'envoyer à la corbeille DGI ?')) {
+            await updateDoc(doc(db, 'users', agentId), {
+                isActive: false,
+                status: 'deleted_trash',
+                deletedAt: serverTimestamp()
+            });
+            await updateDoc(doc(db, 'agents', agentId), {
+                isActive: false,
+                status: 'deleted_trash'
+            });
+            setStatus("Agent suspendu et envoyé dans la corbeille.");
+        }
+    };
+
+    const purgeAgent = async (agentId: string) => {
+        if (confirm('Voulez-vous PURGER DÉFINITIVEMENT cet agent ? Vos modifications seront irréversibles.')) {
             await deleteDoc(doc(db, 'users', agentId));
             await deleteDoc(doc(db, 'agents', agentId));
+            setStatus("Agent supprimé définitivement.");
         }
+    };
+
+    const restoreAgent = async (agent: AppUser) => {
+        await updateDoc(doc(db, 'users', agent.uid), {
+            isActive: true,
+            status: 'active',
+            deletedAt: null
+        });
+        await updateDoc(doc(db, 'agents', agent.uid), {
+            isActive: true,
+            status: 'active'
+        });
+        setStatus(`Agent ${agent.displayName} restauré avec succès.`);
     };
 
     const resetAgentPassword = async (agent: AppUser) => {
@@ -3666,76 +3745,154 @@ const SettingsPage = () => {
                                 </div>
                             </div>
                             
+                            {/* Navigation des fiches agents */}
+                            <div className="flex flex-col sm:flex-row items-center justify-between gap-4 p-2 bg-gray-50 border border-gray-100 rounded-2xl mb-6">
+                                <div className="flex items-center gap-2">
+                                    <button
+                                        onClick={() => setAgentTab('active')}
+                                        className={cn(
+                                            "px-5 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all",
+                                            agentTab === 'active' ? "bg-primary text-white shadow-md shadow-primary/20" : "text-gray-400 hover:text-gray-600 bg-transparent"
+                                        )}
+                                    >
+                                        Fiches Actives ({agents.filter(a => a.isActive !== false && a.status !== 'deleted_trash' && a.status !== 'suspended').length})
+                                    </button>
+                                    <button
+                                        onClick={() => {
+                                            if (user?.email === 'sibinimigjc@gmail.com') {
+                                                setAgentTab('trash');
+                                            } else {
+                                                alert("Accès refusé : Seul l'adresse e-mail correspond au compte maître Super-Admin (sibinimigjc@gmail.com) pour débloquer l'accès à la Corbeille des Agents.");
+                                            }
+                                        }}
+                                        className={cn(
+                                            "px-5 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2",
+                                            agentTab === 'trash' ? "bg-red-600 text-white shadow-md shadow-red-500/20" : "text-gray-400 hover:text-red-500 bg-transparent"
+                                        )}
+                                    >
+                                        <Trash2 size={12} />
+                                        Corbeille des Agents ({agents.filter(a => a.isActive === false || a.status === 'deleted_trash' || a.status === 'suspended').length})
+                                    </button>
+                                </div>
+                                <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest pr-4">
+                                    {agentTab === 'active' ? 'Agents Opérationnels' : 'Profils Suspendus & Révoqués'}
+                                </span>
+                            </div>
+
                             <div className="overflow-hidden bg-white rounded-[2rem] border border-gray-100 shadow-sm">
-                                {agents.length === 0 ? (
-                                    <div className="text-center py-20 opacity-20 border-2 border-dashed border-gray-100 rounded-[2rem] m-6">
-                                        <UserX size={64} className="mx-auto mb-4" />
-                                        <p className="text-xs font-black uppercase tracking-widest">Aucun agent enregistré</p>
+                                {agentTab === 'trash' && user?.email !== 'sibinimigjc@gmail.com' ? (
+                                    <div className="text-center py-20 m-6 border-2 border-dashed border-red-100 rounded-[2rem] bg-red-50/20">
+                                        <ShieldLock size={64} className="mx-auto mb-4 text-red-500" />
+                                        <p className="text-xs font-black uppercase tracking-widest text-[#2C3E50]">Entrée Sécurisée Restreinte</p>
+                                        <p className="text-[10px] text-gray-400 font-bold uppercase mt-2">Désolé, seul le Super-Admin du système peut accéder à la gestion de la corbeille.</p>
                                     </div>
                                 ) : (
-                                    <div className="divide-y divide-gray-50">
-                                        {/* Table Header */}
-                                        <div className="grid grid-cols-12 gap-4 px-8 py-4 bg-gray-50/50 text-[10px] font-black text-gray-400 uppercase tracking-widest">
-                                            <div className="col-span-5">Agent & Email</div>
-                                            <div className="col-span-3 text-center">Rôle DGI</div>
-                                            <div className="col-span-1 text-center">Statut</div>
-                                            <div className="col-span-3 text-right">Actions</div>
-                                        </div>
-                                        
-                                        {agents.map(agent => (
-                                            <div 
-                                                key={agent.uid} 
-                                                className={cn(
-                                                    "grid grid-cols-12 gap-4 px-8 py-5 items-center hover:bg-gray-50/80 transition-all group",
-                                                    !agent.isActive && "opacity-50"
-                                                )}
-                                            >
-                                                <div 
-                                                    onClick={() => openEditAgent(agent)}
-                                                    className="col-span-5 flex items-center gap-4 cursor-pointer hover:opacity-80 group/row transition-all"
-                                                    title="Modifier les habilitations de l'agent"
-                                                >
-                                                    <div className="w-10 h-10 rounded-xl bg-primary/5 text-primary flex items-center justify-center font-black uppercase shadow-sm border border-primary/10 group-hover/row:scale-110 transition-transform">
-                                                        {agent.displayName[0]}
-                                                    </div>
-                                                    <div className="min-w-0">
-                                                        <p className="text-sm font-black text-[#2C3E50] truncate group-hover/row:text-primary transition-colors">{agent.displayName}</p>
-                                                        <p className="text-[10px] text-gray-400 font-medium truncate italic">{agent.email}</p>
-                                                    </div>
-                                                </div>
-                                                
-                                                <div className="col-span-3 flex justify-center">
-                                                    <span className={cn(
-                                                        "px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-widest border",
-                                                        agent.role === 'admin' ? "bg-primary text-white border-primary shadow-sm" : "bg-blue-50 text-blue-600 border-blue-100"
-                                                    )}>
-                                                        {agent.role === 'admin' ? 'Superviseur' : 'Gestionnaire'}
-                                                    </span>
-                                                </div>
-                                                
-                                                <div className="col-span-1 flex justify-center">
-                                                    <div className={cn("w-2 h-2 rounded-full", agent.isActive ? "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.4)]" : "bg-gray-300")} title={agent.isActive ? 'Actif' : 'Désactivé'} />
-                                                </div>
+                                    <>
+                                        {(() => {
+                                            const filteredList = agentTab === 'active'
+                                                ? agents.filter(a => a.isActive !== false && a.status !== 'deleted_trash' && a.status !== 'suspended')
+                                                : agents.filter(a => a.isActive === false || a.status === 'deleted_trash' || a.status === 'suspended');
 
-                                                <div className="col-span-3 flex justify-end gap-2">
-                                                    <button 
-                                                        onClick={() => setViewingAgentProfile(agent)}
-                                                        className="px-4 py-2 bg-white border border-gray-200 text-gray-600 rounded-lg text-[9px] font-black uppercase tracking-widest hover:bg-primary hover:text-white hover:border-primary transition-all shadow-sm"
-                                                    >
-                                                        Gérer le profil
-                                                    </button>
-                                                    <button 
-                                                        onClick={() => openEditAgent(agent)}
-                                                        className="px-4 py-2 bg-primary/10 border border-primary/20 text-primary rounded-lg text-[9px] font-black uppercase tracking-widest hover:bg-primary hover:text-white hover:border-primary transition-all shadow-sm flex items-center gap-1"
-                                                        title="Paramètres d'accès & Habilitations"
-                                                    >
-                                                        <Settings size={12} />
-                                                        <span>Modifier</span>
-                                                    </button>
+                                            if (filteredList.length === 0) {
+                                                return (
+                                                    <div className="text-center py-20 opacity-20 border-2 border-dashed border-gray-100 rounded-[2rem] m-6">
+                                                        <UserX size={64} className="mx-auto mb-4" />
+                                                        <p className="text-xs font-black uppercase tracking-widest">
+                                                            {agentTab === 'active' ? 'Aucun agent actif enregistré' : 'La corbeille des agents est vide'}
+                                                        </p>
+                                                    </div>
+                                                );
+                                            }
+
+                                            return (
+                                                <div className="divide-y divide-gray-50">
+                                                    {/* Table Header */}
+                                                    <div className="grid grid-cols-12 gap-4 px-8 py-4 bg-gray-50/50 text-[10px] font-black text-gray-400 uppercase tracking-widest">
+                                                        <div className="col-span-5">Agent & Email</div>
+                                                        <div className="col-span-3 text-center">Rôle DGI</div>
+                                                        <div className="col-span-1 text-center">Statut</div>
+                                                        <div className="col-span-3 text-right">Actions</div>
+                                                    </div>
+                                                    
+                                                    {filteredList.map(agent => (
+                                                        <div 
+                                                            key={agent.uid} 
+                                                            className={cn(
+                                                                "grid grid-cols-12 gap-4 px-8 py-5 items-center hover:bg-gray-50/80 transition-all group",
+                                                                !agent.isActive && "opacity-75 bg-gray-50/30"
+                                                            )}
+                                                        >
+                                                            <div 
+                                                                onClick={() => { if (agentTab === 'active') openEditAgent(agent); }}
+                                                                className={cn("col-span-5 flex items-center gap-4 transition-all", agentTab === 'active' ? "cursor-pointer hover:opacity-80 group/row" : "")}
+                                                                title={agentTab === 'active' ? "Modifier les habilitations de l'agent" : undefined}
+                                                            >
+                                                                <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center font-black uppercase shadow-sm border", agentTab === 'trash' ? "bg-red-50 text-red-600 border-red-100" : "bg-primary/5 text-primary border-primary/10 group-hover/row:scale-110 transition-transform")}>
+                                                                    {agent.displayName?.[0] || 'A'}
+                                                                </div>
+                                                                <div className="min-w-0">
+                                                                    <p className="text-sm font-black text-[#2C3E50] truncate">{agent.displayName || 'Agent Sans Nom'}</p>
+                                                                    <p className="text-[10px] text-gray-400 font-medium truncate italic">{agent.email}</p>
+                                                                </div>
+                                                            </div>
+                                                            
+                                                            <div className="col-span-3 flex justify-center">
+                                                                <span className={cn(
+                                                                    "px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-widest border",
+                                                                    agent.role === 'admin' ? "bg-primary text-white border-primary shadow-sm" : "bg-blue-50 text-blue-600 border-blue-100"
+                                                                )}>
+                                                                    {agent.role === 'admin' ? 'Superviseur' : 'Gestionnaire'}
+                                                                </span>
+                                                            </div>
+                                                            
+                                                            <div className="col-span-1 flex justify-center">
+                                                                <div className={cn("px-2 py-1 text-[8px] font-black uppercase tracking-wider rounded", agent.isActive ? "bg-green-100 text-green-700" : (agent.status === 'deleted_trash' ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-700"))}>
+                                                                    {agent.isActive ? 'Actif' : (agent.status === 'deleted_trash' ? 'Révoqué' : 'Suspendu')}
+                                                                </div>
+                                                            </div>
+
+                                                            <div className="col-span-3 flex justify-end gap-2">
+                                                                {agentTab === 'active' ? (
+                                                                    <>
+                                                                        <button 
+                                                                            onClick={() => setViewingAgentProfile(agent)}
+                                                                            className="px-4 py-2 bg-white border border-gray-200 text-gray-600 rounded-lg text-[9px] font-black uppercase tracking-widest hover:bg-primary hover:text-white hover:border-primary transition-all shadow-sm"
+                                                                        >
+                                                                            Gérer le profil
+                                                                        </button>
+                                                                        <button 
+                                                                            onClick={() => openEditAgent(agent)}
+                                                                            className="px-4 py-2 bg-primary/10 border border-primary/20 text-primary rounded-lg text-[9px] font-black uppercase tracking-widest hover:bg-primary hover:text-white hover:border-primary transition-all shadow-sm flex items-center gap-1"
+                                                                            title="Paramètres d'accès & Habilitations"
+                                                                        >
+                                                                            <Settings size={12} />
+                                                                            <span>Modifier</span>
+                                                                        </button>
+                                                                    </>
+                                                                ) : (
+                                                                    <>
+                                                                        <button 
+                                                                            onClick={() => restoreAgent(agent)}
+                                                                            className="px-4 py-2 bg-green-50 border border-green-200 text-green-600 rounded-lg text-[9px] font-black uppercase tracking-widest hover:bg-green-600 hover:text-white transition-all shadow-sm"
+                                                                        >
+                                                                            Réactiver
+                                                                        </button>
+                                                                        <button 
+                                                                            onClick={() => purgeAgent(agent.uid)}
+                                                                            className="px-4 py-2 bg-red-50 border border-red-200 text-red-600 rounded-lg text-[9px] font-black uppercase tracking-widest hover:bg-red-600 hover:text-white transition-all shadow-sm"
+                                                                            title="Suppression définitive"
+                                                                        >
+                                                                            Purger
+                                                                        </button>
+                                                                    </>
+                                                                )}
+                                                            </div>
+                                                        </div>
+                                                    ))}
                                                 </div>
-                                            </div>
-                                        ))}
-                                    </div>
+                                            );
+                                        })()}
+                                    </>
                                 )}
                             </div>
                         </div>

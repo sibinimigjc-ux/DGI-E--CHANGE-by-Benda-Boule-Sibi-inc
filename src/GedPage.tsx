@@ -5,7 +5,7 @@ import {
   AlertCircle, Eye, Download, Edit, Copy, Move, 
   Clipboard, X, Key, CheckCircle2, UserCheck, RefreshCw,
   Search, FileText, Grid, List, Plus, ShieldCheck, HardDrive,
-  UserCircle
+  UserCircle, ShieldAlert, Users
 } from 'lucide-react';
 import { collection, query, where, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDocs, or, and, serverTimestamp, setDoc } from 'firebase/firestore';
 import { db } from './lib/firebase';
@@ -119,6 +119,27 @@ export default function GedPage() {
   const [verifyPrivatePasscodeVal, setVerifyPrivatePasscodeVal] = useState('');
   const [verifyPrivateError, setVerifyPrivateError] = useState('');
 
+  // Global Administrative Passcode States
+  const [globalGedPasscode, setGlobalGedPasscode] = useState<string>('');
+  const [isAdministrativeUnlocked, setIsAdministrativeUnlocked] = useState(false);
+  const [enterAdministrativePasscode, setEnterAdministrativePasscode] = useState(false);
+  const [verifyAdministrativePasscodeVal, setVerifyAdministrativePasscodeVal] = useState('');
+  const [verifyAdministrativeError, setVerifyAdministrativeError] = useState('');
+
+  // Setup Global Passcode modal states
+  const [showSetGlobalGedPasscodeModal, setShowSetGlobalGedPasscodeModal] = useState(false);
+  const [globalGedPasscodeInput, setGlobalGedPasscodeInput] = useState('');
+  const [globalGedPasscodeConfirm, setGlobalGedPasscodeConfirm] = useState('');
+  const [globalGedPasscodeError, setGlobalGedPasscodeError] = useState('');
+
+  // GED parameters modal states
+  const [showGedSettings, setShowGedSettings] = useState(false);
+  const [promptCheckCurrentCode, setPromptCheckCurrentCode] = useState<{
+    target: 'disable_private' | 'change_private' | 'disable_administrative' | 'change_administrative';
+  } | null>(null);
+  const [checkCurrentCodeVal, setCheckCurrentCodeVal] = useState('');
+  const [checkCurrentCodeError, setCheckCurrentCodeError] = useState('');
+
   // Global Admin locks for folders/files
   const [showLockSettingItem, setShowLockSettingItem] = useState<GedItem | null>(null);
   const [lockPasscodeInput, setLockPasscodeInput] = useState('');
@@ -188,6 +209,26 @@ export default function GedPage() {
     }
   }, [statusText]);
 
+  // Listen for global administrative passcode
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, 'settings', 'branding'), (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.data();
+        setGlobalGedPasscode(data.globalGedPasscode || '');
+      }
+    });
+    return () => unsub();
+  }, []);
+
+  // Enforce single viewport for taxpayer contributors (Espace Administratif / Gestion des dossiers)
+  useEffect(() => {
+    if (user?.role === 'contributor' && currentSpace !== 'contributor') {
+      setCurrentSpace('contributor');
+      setCurrentFolderId(null);
+      setBreadcrumbs([]);
+    }
+  }, [user, currentSpace]);
+
   if (!user) {
     return (
       <div className="flex flex-col items-center justify-center h-full p-10 bg-[#F4F7F6]">
@@ -224,9 +265,116 @@ export default function GedPage() {
         setStatusText("Accès refusé : Votre administrateur a restreint votre accès à cet espace.");
         return;
       }
+      // Check if global passcode is set and space is not yet unlocked
+      if (globalGedPasscode && !isAdministrativeUnlocked && !isSuperUser) {
+        setEnterAdministrativePasscode(true);
+        setVerifyAdministrativePasscodeVal('');
+        setVerifyAdministrativeError('');
+      } else {
+        setCurrentSpace('administrative');
+        setCurrentFolderId(null);
+        setBreadcrumbs([]);
+      }
+    }
+  };
+
+  // Verify passcode Administrative
+  const handleVerifyAdministrativePasscode = () => {
+    if (verifyAdministrativePasscodeVal === globalGedPasscode || isSuperUser) {
+      setIsAdministrativeUnlocked(true);
+      setEnterAdministrativePasscode(false);
       setCurrentSpace('administrative');
       setCurrentFolderId(null);
       setBreadcrumbs([]);
+    } else {
+      setVerifyAdministrativeError("Code secret incorrect. Accès refusé.");
+    }
+  };
+
+  // Set global Administrative passcode
+  const handleSetGlobalGedPasscode = async () => {
+    if (!globalGedPasscodeInput || globalGedPasscodeInput.length < 4) {
+      setGlobalGedPasscodeError("Le code doit avoir au moins 4 caractères.");
+      return;
+    }
+    if (globalGedPasscodeInput !== globalGedPasscodeConfirm) {
+      setGlobalGedPasscodeError("Les codes ne correspondent pas.");
+      return;
+    }
+    try {
+      await setDoc(doc(db, 'settings', 'branding'), {
+        globalGedPasscode: globalGedPasscodeInput
+      }, { merge: true });
+      setIsAdministrativeUnlocked(true);
+      setShowSetGlobalGedPasscodeModal(false);
+      setStatusText("Code d'accès global administratif enregistré avec succès !");
+      setCurrentSpace('administrative');
+      setCurrentFolderId(null);
+      setBreadcrumbs([]);
+    } catch (e) {
+      console.error(e);
+      setGlobalGedPasscodeError("Erreur d'écriture.");
+    }
+  };
+
+  // Deactivate or modify private / administrative passcode only with correct current passcode verification
+  const handleVerifyCurrentCodeBeforeAction = async () => {
+    if (!promptCheckCurrentCode) return;
+    
+    if (promptCheckCurrentCode.target === 'disable_private' || promptCheckCurrentCode.target === 'change_private') {
+      // Check private passcode
+      if (checkCurrentCodeVal !== user.gedPasscode && !isSuperUser) {
+        setCheckCurrentCodeError("Code d'accès actuel incorrect.");
+        return;
+      }
+      
+      if (promptCheckCurrentCode.target === 'disable_private') {
+        try {
+          await updateDoc(doc(db, 'users', user.uid), {
+            gedPasscode: null
+          });
+          setIsPrivateUnlocked(false);
+          setPromptCheckCurrentCode(null);
+          setStatusText("Verrouillage de l'Espace Privé désactivé avec succès !");
+        } catch (e) {
+          console.error(e);
+          setCheckCurrentCodeError("Erreur d'écriture.");
+        }
+      } else {
+        // Change
+        setPromptCheckCurrentCode(null);
+        setShowSetPrivatePasscode(true);
+        setPrivatePasscodeInput('');
+        setPrivatePasscodeConfirm('');
+        setPrivatePasscodeError('');
+      }
+    } else if (promptCheckCurrentCode.target === 'disable_administrative' || promptCheckCurrentCode.target === 'change_administrative') {
+      // Check global passcode
+      if (checkCurrentCodeVal !== globalGedPasscode && !isSuperUser) {
+        setCheckCurrentCodeError("Code de direction actuel incorrect.");
+        return;
+      }
+      
+      if (promptCheckCurrentCode.target === 'disable_administrative') {
+        try {
+          await setDoc(doc(db, 'settings', 'branding'), {
+            globalGedPasscode: null
+          }, { merge: true });
+          setIsAdministrativeUnlocked(false);
+          setPromptCheckCurrentCode(null);
+          setStatusText("Verrouillage de l'Espace Administratif désactivé avec succès !");
+        } catch (e) {
+          console.error(e);
+          setCheckCurrentCodeError("Erreur d'écriture.");
+        }
+      } else {
+        // Change
+        setPromptCheckCurrentCode(null);
+        setShowSetGlobalGedPasscodeModal(true);
+        setGlobalGedPasscodeInput('');
+        setGlobalGedPasscodeConfirm('');
+        setGlobalGedPasscodeError('');
+      }
     }
   };
 
@@ -624,6 +772,20 @@ export default function GedPage() {
         {/* Toolbar of buttons */}
         {currentSpace && (
           <div className="flex flex-wrap items-center gap-3">
+            {user.role !== 'contributor' && (
+              <button 
+                onClick={() => {
+                  setShowGedSettings(true);
+                  setCheckCurrentCodeVal('');
+                  setCheckCurrentCodeError('');
+                }}
+                className="px-5 py-3 bg-white border border-gray-100 rounded-2xl text-[9px] font-black text-gray-500 hover:text-primary hover:border-primary uppercase tracking-wider hover:bg-gray-50 active:scale-95 transition-all shadow-sm flex items-center gap-2"
+                title="Paramètres de sécurité de la GED"
+              >
+                <Settings size={14} /> Sécurité GED
+              </button>
+            )}
+
             <button 
               onClick={() => { setShowTrash(!showTrash); }}
               className={cn(
@@ -683,22 +845,24 @@ export default function GedPage() {
               Veuillez choisir le périmètre de documents sur lequel vous souhaitez travailler dans ce module sécurisé.
             </p>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-left">
+            <div className={cn("grid gap-6 text-left", user.role === 'contributor' ? "grid-cols-1 max-w-sm mx-auto" : "grid-cols-1 md:grid-cols-2")}>
               {/* Private Space Box */}
-              <button 
-                onClick={() => handleSelectSpace('private')}
-                className="p-8 bg-gray-50 hover:bg-white hover:shadow-2xl hover:scale-[1.03] border border-gray-100 hover:border-primary/20 rounded-[2.5rem] transition-all group flex flex-col justify-between"
-              >
-                <div>
-                  <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mb-6 group-hover:scale-110 transition-transform shadow-inner">
-                    <UserCircle size={24} />
+              {user.role !== 'contributor' && (
+                <button 
+                  onClick={() => handleSelectSpace('private')}
+                  className="p-8 bg-gray-50 hover:bg-white hover:shadow-2xl hover:scale-[1.03] border border-gray-100 hover:border-primary/20 rounded-[2.5rem] transition-all group flex flex-col justify-between"
+                >
+                  <div>
+                    <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mb-6 group-hover:scale-110 transition-transform shadow-inner">
+                      <UserCircle size={24} />
+                    </div>
+                    <h3 className="text-base font-black text-[#2C3E50] group-hover:text-primary transition-colors">Espace Privé</h3>
+                    <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest mt-2 leading-relaxed">
+                      Silo de documents propre à votre compte. Possibilité de verrouillage par code personnel.
+                    </p>
                   </div>
-                  <h3 className="text-base font-black text-[#2C3E50] group-hover:text-primary transition-colors">Espace Privé</h3>
-                  <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest mt-2 leading-relaxed">
-                    Silo de documents propre à votre compte. Possibilité de verrouillage par code personnel.
-                  </p>
-                </div>
-              </button>
+                </button>
+              )}
 
               {/* Administrative Space Box */}
               <button 
@@ -712,37 +876,66 @@ export default function GedPage() {
                   <div className="w-12 h-12 bg-emerald-50 text-emerald-600 rounded-2xl flex items-center justify-center mb-6 group-hover:scale-110 transition-transform shadow-inner">
                     <ShieldCheck size={24} />
                   </div>
-                  <h3 className="text-base font-black text-[#2C3E50] group-hover:text-primary transition-colors">Espace Administratif</h3>
+                  <h3 className="text-base font-black text-[#2C3E50] group-hover:text-primary transition-colors">
+                    {user.role === 'contributor' ? 'Gestion des dossiers (Espace Administratif)' : 'Espace Administratif'}
+                  </h3>
                   <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest mt-2 leading-relaxed">
-                    Fichiers d'exercice légal de la DGI ou dossiers d'habilitation. Droits restreints par les administrateurs.
+                    {user.role === 'contributor' ? 'Accédez directement à vos dossiers professionnels de déclaration et de suivi fiscal.' : "Fichiers d'exercice de la DGI ou dossiers d'habilitation. Droits restreints par les administrateurs."}
                   </p>
                 </div>
               </button>
             </div>
 
-            {/* Code Private passcode warning and secure tool inside prompt */}
-            {!user.gedPasscode && !isSuperUser && (
-              <div className="mt-8 p-4 bg-orange-50 border border-orange-100 rounded-2xl text-left flex items-center justify-between gap-4">
-                <div className="flex gap-3">
-                  <AlertCircle size={20} className="text-orange-500 shrink-0" />
-                  <div>
-                    <h5 className="text-[10px] font-black text-orange-600 uppercase tracking-widest">Alerte Sécurité</h5>
-                    <p className="text-[9px] text-orange-500 font-bold mt-1">Vous n'avez pas encore défini de code de verrouillage pour votre Espace Privé.</p>
+            {/* Dual Security Warnings */}
+            <div className="space-y-4 mt-8">
+              {/* Alerte 1 (Espace Privé) — For everyone (agents/admins/Super-Admin) if private passcode is missing */}
+              {(user.role === 'agent' || user.role === 'admin' || isSuperUser) && !user.gedPasscode && (
+                <div className="p-4 bg-orange-50 border border-orange-100 rounded-2xl text-left flex items-center justify-between gap-4">
+                  <div className="flex gap-3">
+                    <AlertCircle size={20} className="text-orange-500 shrink-0" />
+                    <div>
+                      <h5 className="text-[10px] font-black text-orange-600 uppercase tracking-widest">Alerte Sécurité - Espace Privé</h5>
+                      <p className="text-[9px] text-orange-500 font-bold mt-1">Vous n'avez pas encore défini de code de verrouillage pour votre Espace Privé.</p>
+                    </div>
                   </div>
+                  <button 
+                    onClick={() => {
+                      setShowSetPrivatePasscode(true);
+                      setPrivatePasscodeInput('');
+                      setPrivatePasscodeConfirm('');
+                      setPrivatePasscodeError('');
+                    }}
+                    className="px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white font-black text-[9px] uppercase tracking-wider rounded-xl transition-all shadow-sm shrink-0"
+                  >
+                    Configurer code
+                  </button>
                 </div>
-                <button 
-                  onClick={() => {
-                    setShowSetPrivatePasscode(true);
-                    setPrivatePasscodeInput('');
-                    setPrivatePasscodeConfirm('');
-                    setPrivatePasscodeError('');
-                  }}
-                  className="px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white font-black text-[9px] uppercase tracking-wider rounded-xl transition-all shadow-sm"
-                >
-                  Configurer code
-                </button>
-              </div>
-            )}
+              )}
+
+              {/* Alerte 2 (Espace Administratif) — For Super-Admin and Admins only, if global passcode is missing */}
+              {(user.role === 'admin' || isSuperUser) && !globalGedPasscode && (
+                <div className="p-4 bg-amber-50 border border-amber-100 rounded-2xl text-left flex items-center justify-between gap-4">
+                  <div className="flex gap-3">
+                    <ShieldAlert size={20} className="text-amber-500 shrink-0" />
+                    <div>
+                      <h5 className="text-[10px] font-black text-amber-600 uppercase tracking-widest">Alerte Sécurité - Espace Administratif</h5>
+                      <p className="text-[9px] text-amber-500 font-bold mt-1">Aucun mot de passe global n'a été configuré pour l'Espace Administratif commun.</p>
+                    </div>
+                  </div>
+                  <button 
+                    onClick={() => {
+                      setShowSetGlobalGedPasscodeModal(true);
+                      setGlobalGedPasscodeInput('');
+                      setGlobalGedPasscodeConfirm('');
+                      setGlobalGedPasscodeError('');
+                    }}
+                    className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white font-black text-[9px] uppercase tracking-wider rounded-xl transition-all shadow-sm shrink-0"
+                  >
+                    Configurer code
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       ) : (
@@ -752,13 +945,17 @@ export default function GedPage() {
           <div className="p-6 border-b border-gray-100 bg-gray-50/50 flex flex-col md:flex-row md:items-center justify-between gap-4 shrink-0">
             {/* Breadcrumbs navigation */}
             <div className="flex flex-wrap items-center gap-2 text-xs font-black uppercase tracking-widest">
-              <button 
-                onClick={() => { setCurrentSpace(null); setShowTrash(false); }}
-                className="text-gray-400 hover:text-primary transition-colors flex items-center gap-1"
-              >
-                GED Accueil
-              </button>
-              <ChevronRight size={14} className="text-gray-300" />
+              {user.role !== 'contributor' && (
+                <>
+                  <button 
+                    onClick={() => { setCurrentSpace(null); setShowTrash(false); }}
+                    className="text-gray-400 hover:text-primary transition-colors flex items-center gap-1"
+                  >
+                    GED Accueil
+                  </button>
+                  <ChevronRight size={14} className="text-gray-300" />
+                </>
+              )}
               <button 
                 onClick={() => { handleBreadcrumbClick(-1); setShowTrash(false); }}
                 className={cn("hover:text-primary transition-colors", currentFolderId === null && !showTrash ? "text-primary font-black" : "text-gray-400")}
@@ -1141,6 +1338,272 @@ export default function GedPage() {
         </div>
       )}
 
+      {/* MODAL: GED Security Settings */}
+      {showGedSettings && (
+        <div className="fixed inset-0 z-[150] flex items-center justify-center bg-gray-900/60 backdrop-blur-md p-4 animate-in fade-in duration-300">
+          <div className="bg-white p-8 md:p-10 rounded-[3.5rem] shadow-2xl max-w-lg w-full border border-white">
+            <div className="flex items-center justify-between mb-6">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-indigo-50 text-[#2C3E50] rounded-xl">
+                  <ShieldCheck size={20} className="text-indigo-600" />
+                </div>
+                <h2 className="text-xl font-black text-[#2C3E50] uppercase italic tracking-tight">Sécurité de la GED</h2>
+              </div>
+              <button onClick={() => setShowGedSettings(false)} className="p-2 text-gray-400 hover:text-gray-600 rounded-lg"><X size={18} /></button>
+            </div>
+
+            <div className="space-y-6 divide-y divide-gray-100">
+              {/* Espace Privé Section */}
+              <div className="pt-2">
+                <h3 className="text-xs font-black text-indigo-900 uppercase tracking-wider mb-2">Configurez votre Espace Privé</h3>
+                {user.gedPasscode ? (
+                  <div className="space-y-3">
+                    <p className="text-xs text-green-600 font-bold flex items-center gap-2">
+                      <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+                      Le code de verrouillage de votre Espace Privé est activé.
+                    </p>
+                    <div className="flex gap-2">
+                      <button 
+                        onClick={() => {
+                          setPromptCheckCurrentCode({ target: 'disable_private' });
+                          setCheckCurrentCodeVal('');
+                          setCheckCurrentCodeError('');
+                          setShowGedSettings(false);
+                        }}
+                        className="px-4 py-2 bg-red-50 text-red-600 hover:bg-red-100 font-black text-[9px] uppercase tracking-wider rounded-xl transition-all"
+                      >
+                        Passer en Accès Libre
+                      </button>
+                      <button 
+                        onClick={() => {
+                          setPromptCheckCurrentCode({ target: 'change_private' });
+                          setCheckCurrentCodeVal('');
+                          setCheckCurrentCodeError('');
+                          setShowGedSettings(false);
+                        }}
+                        className="px-4 py-2 bg-indigo-50 text-indigo-600 hover:bg-indigo-100 font-black text-[9px] uppercase tracking-wider rounded-xl transition-all"
+                      >
+                        Changer le Code
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <p className="text-xs text-gray-400 leading-relaxed">
+                      Votre Espace Privé est actuellement en accès libre (non sécurisé).
+                    </p>
+                    <button 
+                      onClick={() => {
+                        setShowSetPrivatePasscode(true);
+                        setPrivatePasscodeInput('');
+                        setPrivatePasscodeConfirm('');
+                        setPrivatePasscodeError('');
+                        setShowGedSettings(false);
+                      }}
+                      className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-black text-[9px] uppercase tracking-wider rounded-xl transition-all"
+                    >
+                      Définir code d'accès
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Espace Administratif Section (only displayed for Admin / SuperUser) */}
+              {(isSuperUser || user.role === 'admin') && (
+                <div className="pt-6">
+                  <h3 className="text-xs font-black text-emerald-950 uppercase tracking-wider mb-2">Espace Administratif Commun</h3>
+                  {globalGedPasscode ? (
+                    <div className="space-y-3">
+                      <p className="text-xs text-green-600 font-bold flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+                        Le verrouillage de direction (Code Commun) est activé.
+                      </p>
+                      <div className="flex gap-2">
+                        <button 
+                          onClick={() => {
+                            setPromptCheckCurrentCode({ target: 'disable_administrative' });
+                            setCheckCurrentCodeVal('');
+                            setCheckCurrentCodeError('');
+                            setShowGedSettings(false);
+                          }}
+                          className="px-4 py-2 bg-red-50 text-red-600 hover:bg-red-100 font-black text-[9px] uppercase tracking-wider rounded-xl transition-all"
+                        >
+                          Désactiver le Verrou
+                        </button>
+                        <button 
+                          onClick={() => {
+                            setPromptCheckCurrentCode({ target: 'change_administrative' });
+                            setCheckCurrentCodeVal('');
+                            setCheckCurrentCodeError('');
+                            setShowGedSettings(false);
+                          }}
+                          className="px-4 py-2 bg-emerald-50 text-emerald-600 hover:bg-emerald-100 font-black text-[9px] uppercase tracking-wider rounded-xl transition-all"
+                        >
+                          Modifier le Code Global
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <p className="text-xs text-gray-400 leading-relaxed">
+                        L'Espace Administratif commun est actuellement ouvert sans restrictions de code globales.
+                      </p>
+                      <button 
+                        onClick={() => {
+                          setShowSetGlobalGedPasscodeModal(true);
+                          setGlobalGedPasscodeInput('');
+                          setGlobalGedPasscodeConfirm('');
+                          setGlobalGedPasscodeError('');
+                          setShowGedSettings(false);
+                        }}
+                        className="px-4 py-2 bg-emerald-650 hover:bg-emerald-700 bg-emerald-600 text-white font-black text-[9px] uppercase tracking-wider rounded-xl transition-all"
+                      >
+                        Configurer Verrou Global de Direction
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: Saisir code actuel pour valider la désactivation ou la modification */}
+      {promptCheckCurrentCode && (
+        <div className="fixed inset-0 z-[150] flex items-center justify-center bg-gray-900/60 backdrop-blur-md p-4 animate-in fade-in duration-300">
+          <div className="bg-white p-8 md:p-10 rounded-[3.5rem] shadow-2xl max-w-sm w-full border border-white">
+            <h2 className="text-base font-black text-[#2C3E50] uppercase italic tracking-tight mb-4 text-center">Validation requise</h2>
+            <p className="text-xs text-gray-400 mb-6 text-center leading-relaxed">
+              Pour pouvoir désactiver ce verrou ou en modifier les paramètres, vous devez préalablement saisir votre code secret actuel.
+            </p>
+            <div className="space-y-4">
+              <input 
+                type="password"
+                className="w-full px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl text-xs font-black shadow-inner outline-none text-center tracking-[0.5em]"
+                value={checkCurrentCodeVal}
+                onChange={e => setCheckCurrentCodeVal(e.target.value)}
+                placeholder="••••"
+                onKeyDown={e => e.key === 'Enter' && handleVerifyCurrentCodeBeforeAction()}
+              />
+
+              {checkCurrentCodeError && (
+                <p className="text-[10px] text-red-600 font-bold uppercase tracking-wide text-center">{checkCurrentCodeError}</p>
+              )}
+
+              <div className="flex gap-4 pt-4">
+                <button 
+                  onClick={() => setPromptCheckCurrentCode(null)}
+                  className="flex-1 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest"
+                >
+                  Annuler
+                </button>
+                <button 
+                  onClick={handleVerifyCurrentCodeBeforeAction}
+                  className="flex-1 py-4 bg-primary text-white rounded-2xl font-black text-[10px] uppercase tracking-widest shadow-xl shadow-primary/20 hover:brightness-110 active:scale-95 transition-all"
+                >
+                  Confirmer
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: Set Collective Administrative Passcode */}
+      {showSetGlobalGedPasscodeModal && (
+        <div className="fixed inset-0 z-[150] flex items-center justify-center bg-gray-900/60 backdrop-blur-md p-4 animate-in fade-in duration-300">
+          <div className="bg-white p-8 md:p-10 rounded-[3.5rem] shadow-2xl max-w-md w-full border border-white">
+            <h2 className="text-xl font-black text-[#2C3E50] uppercase italic tracking-tight mb-4 text-center text-emerald-950">Verrou de Direction Commun</h2>
+            <p className="text-xs text-gray-400 mb-6 text-center leading-relaxed">
+              Définissez le mot de passe de direction pour l'accès de l'Espace Administratif commun.
+            </p>
+            <div className="space-y-4">
+              <div className="space-y-1">
+                <label className="text-[9px] font-bold text-gray-400 uppercase tracking-widest pl-1">Saisir le mot de passe</label>
+                <input 
+                  type="password"
+                  className="w-full px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl text-xs font-black shadow-inner outline-none"
+                  value={globalGedPasscodeInput}
+                  onChange={e => setGlobalGedPasscodeInput(e.target.value)}
+                  placeholder="••••••••"
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-[9px] font-bold text-gray-400 uppercase tracking-widest pl-1">Confirmer le mot de passe</label>
+                <input 
+                  type="password"
+                  className="w-full px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl text-xs font-black shadow-inner outline-none"
+                  value={globalGedPasscodeConfirm}
+                  onChange={e => setGlobalGedPasscodeConfirm(e.target.value)}
+                  placeholder="••••••••"
+                />
+              </div>
+
+              {globalGedPasscodeError && (
+                <p className="text-[10px] text-red-600 font-bold uppercase tracking-wide">{globalGedPasscodeError}</p>
+              )}
+
+              <div className="flex gap-4 pt-4">
+                <button 
+                  onClick={() => setShowSetGlobalGedPasscodeModal(false)}
+                  className="flex-1 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest"
+                >
+                  Fermer
+                </button>
+                <button 
+                  onClick={handleSetGlobalGedPasscode}
+                  className="flex-1 py-4 bg-emerald-600 hover:bg-emerald-700 text-white rounded-2xl font-black text-[10px] uppercase tracking-widest shadow-xl shadow-green-500/20 active:scale-95 transition-all"
+                >
+                  Verrouiller
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: Verify Administrative space-level global passcode */}
+      {enterAdministrativePasscode && (
+        <div className="fixed inset-0 z-[150] flex items-center justify-center bg-gray-900/60 backdrop-blur-md p-4 animate-in fade-in duration-300">
+          <div className="bg-white p-8 md:p-10 rounded-[3.5rem] shadow-2xl max-w-sm w-full border border-white">
+            <h2 className="text-xl font-black text-[#2C3E50] uppercase italic tracking-tight mb-4 text-center">Habilitation Requise</h2>
+            <p className="text-xs text-gray-400 mb-6 text-center leading-relaxed">
+              Veuillez saisir le mot de passe de verrouillage général de la direction pour libérer l'accès.
+            </p>
+            <div className="space-y-4">
+              <input 
+                type="password"
+                className="w-full px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl text-xs font-black shadow-inner outline-none text-center tracking-[0.5em]"
+                value={verifyAdministrativePasscodeVal}
+                onChange={e => setVerifyAdministrativePasscodeVal(e.target.value)}
+                placeholder="••••••••"
+                onKeyDown={e => e.key === 'Enter' && handleVerifyAdministrativePasscode()}
+              />
+
+              {verifyAdministrativeError && (
+                <p className="text-[10px] text-red-600 font-bold uppercase tracking-wide text-center">{verifyAdministrativeError}</p>
+              )}
+
+              <div className="flex gap-4 pt-4">
+                <button 
+                  onClick={() => setEnterAdministrativePasscode(false)}
+                  className="flex-1 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest"
+                >
+                  Retour
+                </button>
+                <button 
+                  onClick={handleVerifyAdministrativePasscode}
+                  className="flex-1 py-4 bg-primary text-white rounded-2xl font-black text-[10px] uppercase tracking-widest shadow-xl shadow-primary/20 hover:brightness-110 active:scale-95 transition-all"
+                >
+                  Confirmer
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* MODAL: Setup global passcode lock on item */}
       {showLockSettingItem && (
         <div className="fixed inset-0 z-[150] flex items-center justify-center bg-gray-900/60 backdrop-blur-md p-4">
@@ -1383,6 +1846,287 @@ export default function GedPage() {
                   </a>
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: Set Global GED Passcode */}
+      {showSetGlobalGedPasscodeModal && (
+        <div className="fixed inset-0 z-[150] flex items-center justify-center bg-gray-900/60 backdrop-blur-md p-4 animate-in fade-in duration-300">
+          <div className="bg-white p-8 md:p-10 rounded-[3.5rem] shadow-2xl max-w-md w-full border border-white animate-in zoom-in duration-300">
+            <h2 className="text-xl font-black text-[#2C3E50] uppercase italic tracking-tight mb-4 text-center">Sécuriser l'Espace Administratif</h2>
+            <p className="text-xs text-gray-400 mb-6 text-center leading-relaxed">
+              Ce mot de passe de direction global sera exigé de tous les agents pour accéder à l'Espace Administratif commun.
+            </p>
+            <div className="space-y-4">
+              <div className="space-y-1">
+                <label className="text-[9px] font-bold text-gray-400 uppercase tracking-widest pl-1">Entrer un code global</label>
+                <input 
+                  type="password"
+                  className="w-full px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl text-xs font-black shadow-inner outline-none"
+                  value={globalGedPasscodeInput}
+                  onChange={e => setGlobalGedPasscodeInput(e.target.value)}
+                  placeholder="••••••••"
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-[9px] font-bold text-gray-400 uppercase tracking-widest pl-1">Confirmer le code global</label>
+                <input 
+                  type="password"
+                  className="w-full px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl text-xs font-black shadow-inner outline-none"
+                  value={globalGedPasscodeConfirm}
+                  onChange={e => setGlobalGedPasscodeConfirm(e.target.value)}
+                  placeholder="••••••••"
+                />
+              </div>
+
+              {globalGedPasscodeError && (
+                <p className="text-[10px] text-red-600 font-bold uppercase tracking-wide">{globalGedPasscodeError}</p>
+              )}
+
+              <div className="flex gap-4 pt-4">
+                <button 
+                  onClick={() => setShowSetGlobalGedPasscodeModal(false)}
+                  className="flex-1 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest"
+                >
+                  Fermer
+                </button>
+                <button 
+                  onClick={handleSetGlobalGedPasscode}
+                  className="flex-1 py-4 bg-primary text-white rounded-2xl font-black text-[10px] uppercase tracking-widest shadow-xl shadow-primary/20 hover:brightness-110 active:scale-95 transition-all"
+                >
+                  Verrouiller
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: Prompt passcode lock Administrative */}
+      {enterAdministrativePasscode && (
+        <div className="fixed inset-0 z-[150] flex items-center justify-center bg-gray-900/60 backdrop-blur-md p-4 animate-in fade-in duration-300">
+          <div className="bg-white p-8 md:p-10 rounded-[3.5rem] shadow-2xl max-w-md w-full border border-white animate-in zoom-in duration-300">
+            <h2 className="text-xl font-black text-[#2C3E50] uppercase italic tracking-tight mb-4 text-center">Déverrouillage Espace Administratif</h2>
+            <p className="text-xs text-gray-400 mb-6 text-center leading-relaxed">
+              Veuillez saisir le code d'accès de la direction pour libérer l'accès aux dossiers administratifs.
+            </p>
+            <div className="space-y-4">
+              <input 
+                type="password"
+                className="w-full px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl text-xs font-black shadow-inner outline-none text-center tracking-[1em]"
+                value={verifyAdministrativePasscodeVal}
+                onChange={e => setVerifyAdministrativePasscodeVal(e.target.value)}
+                placeholder="••••"
+                onKeyDown={e => e.key === 'Enter' && handleVerifyAdministrativePasscode()}
+              />
+
+              {verifyAdministrativeError && (
+                <p className="text-[10px] text-red-600 font-bold uppercase tracking-wide text-center">{verifyAdministrativeError}</p>
+              )}
+
+              <div className="flex gap-4 pt-4">
+                <button 
+                  onClick={() => setEnterAdministrativePasscode(false)}
+                  className="flex-1 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest"
+                >
+                  Retour
+                </button>
+                <button 
+                  onClick={handleVerifyAdministrativePasscode}
+                  className="flex-1 py-4 bg-primary text-white rounded-2xl font-black text-[10px] uppercase tracking-widest shadow-xl shadow-primary/20 hover:brightness-110 active:scale-95 transition-all"
+                >
+                  Entrer
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: GED Settings */}
+      {showGedSettings && (
+        <div className="fixed inset-0 z-[140] flex items-center justify-center bg-gray-900/60 backdrop-blur-md p-4 animate-in fade-in duration-300">
+          <div className="bg-white p-8 md:p-10 rounded-[3.5rem] shadow-2xl max-w-xl w-full border border-white animate-in zoom-in duration-300 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-8">
+              <div className="flex items-center gap-3">
+                <div className="p-3 bg-primary/10 text-primary rounded-2xl shadow-inner">
+                  <Settings size={22} />
+                </div>
+                <div>
+                  <h2 className="text-xl font-black text-[#2C3E50] uppercase italic tracking-tight">Paramètres GED</h2>
+                  <p className="text-[9px] text-gray-400 font-bold uppercase tracking-widest leading-relaxed">Sécurité & Privilèges d'accès</p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setShowGedSettings(false)}
+                className="p-2 bg-gray-50 rounded-xl hover:text-red-500 transition-colors"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="space-y-6 animate-in fade-in slide-in-from-bottom duration-300">
+              {/* Espace Privé Settings */}
+              <div className="p-6 bg-gray-50/50 border border-gray-100 rounded-[2rem] space-y-4">
+                <div className="flex items-center gap-3 border-b border-gray-100 pb-3">
+                  <UserCircle size={18} className="text-indigo-600" />
+                  <h4 className="text-xs font-black text-[#2C3E50] uppercase tracking-wider">Sécurité Espace Privé</h4>
+                </div>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div>
+                    <p className="text-[11px] font-black uppercase text-gray-400">Statut actuel</p>
+                    <p className="text-xs font-bold text-gray-600 mt-1">
+                      {user.gedPasscode ? "🔒 Activé — Silo crypté par code personnel" : "🔓 Désactivé — Accès direct sans code"}
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    {user.gedPasscode ? (
+                      <>
+                        <button 
+                          onClick={() => {
+                            setPromptCheckCurrentCode({ target: 'disable_private' });
+                            setCheckCurrentCodeVal('');
+                            setCheckCurrentCodeError('');
+                          }}
+                          className="px-4 py-2.5 bg-red-50 hover:bg-red-100 text-red-600 rounded-xl text-[9px] font-black uppercase tracking-wider transition-all"
+                        >
+                          Désactiver
+                        </button>
+                        <button 
+                          onClick={() => {
+                            setPromptCheckCurrentCode({ target: 'change_private' });
+                            setCheckCurrentCodeVal('');
+                            setCheckCurrentCodeError('');
+                          }}
+                          className="px-4 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-xl text-[9px] font-black uppercase tracking-wider transition-all"
+                        >
+                          Modifier
+                        </button>
+                      </>
+                    ) : (
+                      <button 
+                        onClick={() => {
+                          setShowSetPrivatePasscode(true);
+                          setPrivatePasscodeInput('');
+                          setPrivatePasscodeConfirm('');
+                          setPrivatePasscodeError('');
+                        }}
+                        className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-[9px] font-black uppercase tracking-wider transition-all shadow-md shadow-indigo-600/10"
+                      >
+                        Activer le verrouillage
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Espace Administratif Settings */}
+              {(isSuperUser || user.role === 'admin') && (
+                <div className="p-6 bg-gray-50/50 border border-gray-100 rounded-[2rem] space-y-4">
+                  <div className="flex items-center gap-3 border-b border-gray-100 pb-3">
+                    <ShieldCheck size={18} className="text-emerald-600" />
+                    <h4 className="text-xs font-black text-[#2C3E50] uppercase tracking-wider">Sécurité Espace Administratif Commun</h4>
+                  </div>
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                    <div>
+                      <p className="text-[11px] font-black uppercase text-gray-400">Statut Direction</p>
+                      <p className="text-xs font-bold text-gray-600 mt-1">
+                        {globalGedPasscode ? "🔒 Activé — Protégé par mot de passe global de direction" : "🔓 Désactivé — Accès libre pour le staff"}
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      {globalGedPasscode ? (
+                        <>
+                          <button 
+                            onClick={() => {
+                              setPromptCheckCurrentCode({ target: 'disable_administrative' });
+                              setCheckCurrentCodeVal('');
+                              setCheckCurrentCodeError('');
+                            }}
+                            className="px-4 py-2.5 bg-red-50 hover:bg-red-100 text-red-600 rounded-xl text-[9px] font-black uppercase tracking-wider transition-all"
+                          >
+                            Désactiver
+                          </button>
+                          <button 
+                            onClick={() => {
+                              setPromptCheckCurrentCode({ target: 'change_administrative' });
+                              setCheckCurrentCodeVal('');
+                              setCheckCurrentCodeError('');
+                            }}
+                            className="px-4 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-xl text-[9px] font-black uppercase tracking-wider transition-all"
+                          >
+                            Modifier
+                          </button>
+                        </>
+                      ) : (
+                        <button 
+                          onClick={() => {
+                            setShowSetGlobalGedPasscodeModal(true);
+                            setGlobalGedPasscodeInput('');
+                            setGlobalGedPasscodeConfirm('');
+                            setGlobalGedPasscodeError('');
+                          }}
+                          className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-[9px] font-black uppercase tracking-wider transition-all shadow-md shadow-emerald-600/10"
+                        >
+                          Activer le verrouillage
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="flex gap-4 pt-8 border-t border-gray-100 mt-8">
+              <button 
+                onClick={() => setShowGedSettings(false)}
+                className="w-full py-4 bg-gray-100 hover:bg-gray-200 text-[#2C3E50] rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all"
+              >
+                Fermer Paramètres
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: Verify Current Passcode Before Modifying/Deactivating */}
+      {promptCheckCurrentCode && (
+        <div className="fixed inset-0 z-[160] flex items-center justify-center bg-gray-900/60 backdrop-blur-md p-4 animate-in fade-in duration-300">
+          <div className="bg-white p-8 md:p-10 rounded-[3.5rem] shadow-2xl max-w-sm w-full border border-white animate-in zoom-in duration-300">
+            <h2 className="text-xl font-black text-[#2C3E50] uppercase italic tracking-tight mb-4 text-center">Vérification de Sécurité</h2>
+            <p className="text-xs text-gray-400 mb-6 text-center leading-relaxed">
+              Pour des raisons de haute sécurité, veuillez confirmer votre code d'accès actuel avant d'appliquer ce changement.
+            </p>
+            <div className="space-y-4">
+              <input 
+                type="password"
+                className="w-full px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl text-xs font-black shadow-inner outline-none text-center tracking-[1em]"
+                value={checkCurrentCodeVal}
+                onChange={e => setCheckCurrentCodeVal(e.target.value)}
+                placeholder="••••"
+                onKeyDown={e => e.key === 'Enter' && handleVerifyCurrentCodeBeforeAction()}
+              />
+
+              {checkCurrentCodeError && (
+                <p className="text-[10px] text-red-600 font-bold uppercase tracking-wide text-center">{checkCurrentCodeError}</p>
+              )}
+
+              <div className="flex gap-4 pt-4">
+                <button 
+                  onClick={() => setPromptCheckCurrentCode(null)}
+                  className="flex-1 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest"
+                >
+                  Annuler
+                </button>
+                <button 
+                  onClick={handleVerifyCurrentCodeBeforeAction}
+                  className="flex-1 py-4 bg-primary text-white rounded-2xl font-black text-[10px] uppercase tracking-widest shadow-xl shadow-primary/20 hover:brightness-110 active:scale-95 transition-all"
+                >
+                  Confirmer
+                </button>
+              </div>
             </div>
           </div>
         </div>

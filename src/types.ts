@@ -36,6 +36,10 @@ export interface AppUser {
   deletedAt?: any;
   restrictGedAdmin?: boolean;
   gedPasscode?: string;
+  poste?: string;
+  perimetre?: 'secretariat' | 'gestionnaire' | 'admin_bureau' | 'superviseur' | 'superviseur_senior';
+  signatureUrl?: string;
+  stampUrl?: string;
 }
 
 export interface GedItem {
@@ -51,6 +55,7 @@ export interface GedItem {
   fileUrl?: string;
   fileSize?: number;
   isDeleted: boolean;
+  extractedText?: string;
   deletedAt?: any;
   isLocked?: boolean;
   lockPasscode?: string;
@@ -63,6 +68,27 @@ export interface GedItem {
   };
   createdAt: any;
   updatedAt?: any;
+  status?: 'Nouveau' | 'En cours' | 'Terminé' | 'Terminé / Envoyé' | 'Archivé';
+  linkedConversationId?: string;
+  versions?: {
+    version: number;
+    fileUrl: string;
+    annotation?: string;
+    hasSignature?: boolean;
+    hasStamp?: boolean;
+    createdBy: string;
+    createdByName: string;
+    createdByRole?: string;
+    createdAt: string;
+  }[];
+  historyLogs?: {
+    id: string;
+    authorName: string;
+    authorRole: string;
+    action: string;
+    description: string;
+    timestamp: string;
+  }[];
 }
 
 export interface Invitation {
@@ -82,6 +108,7 @@ export interface Attachment {
   type?: string;
   size?: number;
   createdAt?: string;
+  extractedText?: string;
 }
 
 export interface Conversation {

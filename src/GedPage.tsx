@@ -5,15 +5,16 @@ import {
   AlertCircle, Eye, Download, Edit, Copy, Move, 
   Clipboard, X, Key, CheckCircle2, UserCheck, RefreshCw,
   Search, FileText, Grid, List, Plus, ShieldCheck, HardDrive,
-  UserCircle, ShieldAlert, Users
+  UserCircle, ShieldAlert, Users, Camera, Loader2
 } from 'lucide-react';
-import { collection, query, where, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDocs, or, and, serverTimestamp, setDoc } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, addDoc, updateDoc, deleteDoc, doc, getDocs, or, and, serverTimestamp, setDoc, deleteField } from 'firebase/firestore';
 import { db } from './lib/firebase';
 import { useAuth, hasPermission } from './App';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { GedItem, AppUser } from './types';
+import DocumentScanner from './DocumentScanner';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -151,9 +152,38 @@ export default function GedPage() {
 
   // File Preview Modal
   const [previewItem, setPreviewItem] = useState<GedItem | null>(null);
+  const [selectedPreviewVersion, setSelectedPreviewVersion] = useState<number | null>(null);
+  const [commentInput, setCommentInput] = useState('');
+  const [applySignatureOnVersion, setApplySignatureOnVersion] = useState(false);
+  const [applyStampOnVersion, setApplyStampOnVersion] = useState(false);
+  const [versionAnnotation, setVersionAnnotation] = useState('');
+  const [isUploadingVersion, setIsUploadingVersion] = useState(false);
 
   // Status & notifications
   const [statusText, setStatusText] = useState('');
+  
+  // Smart Scanner State
+  const [showScanner, setShowScanner] = useState(false);
+
+  // List of active conversations for linking dossiers
+  const [conversations, setConversations] = useState<any[]>([]);
+  const [linkingSearch, setLinkingSearch] = useState('');
+
+  // Fetch active conversations for linking
+  useEffect(() => {
+    if (!user || user.role === 'contributor') return;
+    const qConv = query(
+      collection(db, 'conversations'),
+      where('status', '==', 'open')
+    );
+    const unsubscribe = onSnapshot(qConv, (snapshot) => {
+      const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setConversations(list);
+    }, (error) => {
+      console.error("Error loading conversations in GedPage:", error);
+    });
+    return () => unsubscribe();
+  }, [user]);
 
   // Fetch GED documents
   useEffect(() => {
@@ -444,7 +474,9 @@ export default function GedPage() {
     }).filter(item => {
       // Search term filtering
       if (!searchQuery) return true;
-      return item.name.toLowerCase().includes(searchQuery.toLowerCase());
+      const nameMatch = item.name.toLowerCase().includes(searchQuery.toLowerCase());
+      const ocrMatch = item.extractedText?.toLowerCase().includes(searchQuery.toLowerCase());
+      return nameMatch || ocrMatch;
     });
   };
 
@@ -547,6 +579,355 @@ export default function GedPage() {
     } catch (err) {
       console.error(err);
       setStatusText("Erreur lors du téléversement.");
+    }
+  };
+
+  // Convert scanned physical file and save to active GED
+  const importScannedFileToGed = async (file: File) => {
+    if (!currentSpace) return;
+    const fileExtension = file.name.split('.').pop()?.toLowerCase() || 'pdf';
+
+    try {
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+        const base64Url = event.target?.result as string;
+        
+        const existingInFolder = items
+          .filter(i => i.space === currentSpace && i.parentId === currentFolderId && !i.isDeleted)
+          .map(i => i.name);
+        
+        const uniqueName = generateUniqueNameGed(file.name, existingInFolder);
+
+        const newItem: Partial<GedItem> = {
+          name: uniqueName,
+          type: 'file',
+          parentId: currentFolderId,
+          space: currentSpace,
+          ownerId: user.uid,
+          ownerEmail: user.email,
+          extension: fileExtension,
+          fileUrl: base64Url,
+          fileSize: file.size,
+          isDeleted: false,
+          extractedText: (file as any).extractedText || '',
+          createdBy: {
+            uid: user.uid,
+            displayName: user.displayName || 'Agent',
+            firstName: user.firstName || '',
+            lastName: user.lastName || '',
+            matricule: user.matricule || 'N/A'
+          },
+          createdAt: serverTimestamp()
+        };
+
+        if (currentSpace === 'contributor') {
+          newItem.contributorId = user.role === 'contributor' ? user.uid : (currentFolderId ? items.find(f => f.id === currentFolderId)?.contributorId : '');
+        }
+
+        await addDoc(collection(db, 'ged_items'), newItem);
+        setStatusText(`Document "${uniqueName}" numérisé et enregistré !`);
+        setShowScanner(false);
+      };
+      reader.readAsDataURL(file);
+    } catch (err) {
+      console.error(err);
+      setStatusText("Erreur lors de l'enregistrement du scan.");
+    }
+  };
+
+  const handleUpdateStatus = async (itemId: string, newStatus: 'Nouveau' | 'En cours' | 'Terminé' | 'Terminé / Envoyé' | 'Archivé') => {
+    if (!user) return;
+    
+    // Check hierarchical authorization to revert from 'Terminé / Envoyé' (or 'Terminé') to 'En cours'
+    const currentStatus = previewItem?.status || 'Nouveau';
+         if ((currentStatus === 'Terminé / Envoyé' || currentStatus === 'Terminé') && newStatus === 'En cours') {
+      const isAuthorized = user.role === 'admin' || 
+                           (user.perimetre && ['admin_bureau', 'superviseur', 'superviseur_senior'].includes(user.perimetre));
+      if (!isAuthorized) {
+        setStatusText("Accès refusé : Votre niveau hiérarchique ne vous permet pas de repasser ce dossier au statut 'En cours'.");
+        return;
+      }
+    }
+
+    try {
+      const logEntry = {
+        id: Math.random().toString(36).slice(-6),
+        authorName: user.displayName || 'Agent',
+        authorRole: user.poste || 'Agent DGI',
+        action: 'CHANGEMENT_STATUT',
+        description: `Changement de statut : de "${previewItem?.status || 'Nouveau'}" à "${newStatus}"`,
+        timestamp: new Date().toISOString()
+      };
+      
+      const currentLogs = previewItem?.historyLogs || [];
+      const updatedLogs = [...currentLogs, logEntry];
+
+      // Auto-clôture de la conversation liée si nouveau statut est 'Terminé / Envoyé' ou 'Terminé'
+      if ((newStatus === 'Terminé / Envoyé' || newStatus === 'Terminé') && previewItem?.linkedConversationId) {
+        const convId = previewItem.linkedConversationId;
+        const convRef = doc(db, 'conversations', convId);
+        
+        // Fetch snapshot manually to be secure
+        const { getDoc } = await import('firebase/firestore');
+        const convSnap = await getDoc(convRef);
+        if (convSnap.exists()) {
+          const convData = convSnap.data();
+          const contributorId = convData.contributorId || '';
+          const participants = convData.participants || [];
+          
+          const systemMsg = "Votre dossier a été traité avec succès par les services de la DGI.";
+          
+          // Send automatic closing message in the chat
+          await addDoc(collection(db, 'conversations', convId, 'messages'), {
+            body: systemMsg,
+            participants: participants,
+            senderId: 'system',
+            senderName: 'Système DGI',
+            receiverId: contributorId,
+            attachments: [],
+            hasAttachments: false,
+            createdAt: serverTimestamp(),
+            conversationId: convId
+          });
+          
+          // Update conversation to closed mode (Lecture seule)
+          await updateDoc(convRef, {
+            isClosed: true,
+            status: 'closed',
+            closedAt: serverTimestamp(),
+            closedBy: 'Système DGI (Clôture automatique après traitement de dossier)',
+            lastUpdate: serverTimestamp(),
+            lastMessagePreview: systemMsg
+          });
+          
+          // Log inside the dossier logs
+          const autoCloseLog = {
+            id: Math.random().toString(36).slice(-6),
+            authorName: 'Système DGI',
+            authorRole: 'Serveur de messagerie',
+            action: 'CLOTURE_CONVERSATION_AUTOMATIQUE',
+            description: `Le dossier est Terminé. La conversation liée ID #GED-${convId.slice(0,8).toUpperCase()} a été clôturée et notifiée automatiquement.`,
+            timestamp: new Date().toISOString()
+          };
+          updatedLogs.push(autoCloseLog);
+        }
+      }
+      
+      await updateDoc(doc(db, 'ged_items', itemId), {
+        status: newStatus,
+        historyLogs: updatedLogs,
+        updatedAt: serverTimestamp()
+      });
+      
+      setPreviewItem(prev => prev ? { ...prev, status: newStatus, historyLogs: updatedLogs } : null);
+      setStatusText(`Statut du dossier mis à jour à "${newStatus}"`);
+    } catch (err) {
+      console.error(err);
+      setStatusText("Erreur lors de la mise à jour du statut.");
+    }
+  };
+
+  const handleLinkToConversation = async (itemId: string, convId: string) => {
+    if (!user) return;
+    try {
+      const selectedConvObj = conversations.find(c => c.id === convId);
+      const logEntry = {
+        id: Math.random().toString(36).slice(-6),
+        authorName: user.displayName || 'Agent',
+        authorRole: user.poste || 'Agent DGI',
+        action: 'LIAISON_CONVERSATION',
+        description: `Dossier lié à la conversation #${convId.slice(0, 8).toUpperCase()}${selectedConvObj ? ` de ${selectedConvObj.contributorName || 'Contribuable'} (Sujet: ${selectedConvObj.subject})` : ''}`,
+        timestamp: new Date().toISOString()
+      };
+      
+      const currentLogs = previewItem?.historyLogs || [];
+      const updatedLogs = [...currentLogs, logEntry];
+      
+      await updateDoc(doc(db, 'ged_items', itemId), {
+        linkedConversationId: convId,
+        historyLogs: updatedLogs,
+        updatedAt: serverTimestamp()
+      });
+      
+      setPreviewItem(prev => prev ? { ...prev, linkedConversationId: convId, historyLogs: updatedLogs } : null);
+      setStatusText("Dossier lié avec succès à la conversation !");
+    } catch (err) {
+      console.error(err);
+      setStatusText("Erreur lors de la liaison du dossier.");
+    }
+  };
+
+  const handleUnlinkFromConversation = async (itemId: string) => {
+    if (!user) return;
+    try {
+      const logEntry = {
+        id: Math.random().toString(36).slice(-6),
+        authorName: user.displayName || 'Agent',
+        authorRole: user.poste || 'Agent DGI',
+        action: 'DELIAISON_CONVERSATION',
+        description: `Dossier détaché de la conversation #${previewItem?.linkedConversationId?.slice(0, 8).toUpperCase()}`,
+        timestamp: new Date().toISOString()
+      };
+      
+      const currentLogs = previewItem?.historyLogs || [];
+      const updatedLogs = [...currentLogs, logEntry];
+      
+      await updateDoc(doc(db, 'ged_items', itemId), {
+        linkedConversationId: deleteField(),
+        historyLogs: updatedLogs,
+        updatedAt: serverTimestamp()
+      });
+      
+      setPreviewItem(prev => {
+        if (!prev) return null;
+        const copy = { ...prev, historyLogs: updatedLogs };
+        delete copy.linkedConversationId;
+        return copy;
+      });
+      setStatusText("Dossier détaché avec succès !");
+    } catch (err) {
+      console.error(err);
+      setStatusText("Erreur lors du détachement du dossier.");
+    }
+  };
+
+  const handleAddComment = async (itemId: string) => {
+    if (!user || !commentInput.trim()) return;
+    try {
+      const logEntry = {
+        id: Math.random().toString(36).slice(-6),
+        authorName: user.displayName || 'Agent',
+        authorRole: user.poste || 'Agent DGI',
+        action: 'COMMENTAIRE',
+        description: `Note/Commentaire : "${commentInput.trim()}"`,
+        timestamp: new Date().toISOString()
+      };
+      
+      const currentLogs = previewItem?.historyLogs || [];
+      const updatedLogs = [...currentLogs, logEntry];
+      
+      await updateDoc(doc(db, 'ged_items', itemId), {
+        historyLogs: updatedLogs,
+        updatedAt: serverTimestamp()
+      });
+      
+      setPreviewItem(prev => prev ? { ...prev, historyLogs: updatedLogs } : null);
+      setCommentInput('');
+      setStatusText("Note ajoutée avec succès !");
+    } catch (err) {
+      console.error(err);
+      setStatusText("Erreur lors de l'ajout du commentaire.");
+    }
+  };
+
+  const handleUploadNewVersion = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !previewItem || !user) return;
+    
+    setIsUploadingVersion(true);
+    setStatusText("Traitement de la nouvelle version...");
+    try {
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+        const base64Url = event.target?.result as string;
+        
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = async () => {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(img, 0, 0);
+            
+            // Check if user has signature and requested applying it
+            if (applySignatureOnVersion && user.signatureUrl) {
+              const sigImg = new Image();
+              sigImg.crossOrigin = 'anonymous';
+              await new Promise((resolve) => {
+                sigImg.onload = () => {
+                  const sigW = canvas.width * 0.22;
+                  const sigH = (sigImg.height / sigImg.width) * sigW;
+                  ctx.drawImage(sigImg, canvas.width - sigW - 30, canvas.height - sigH - 30, sigW, sigH);
+                  resolve(true);
+                };
+                sigImg.src = user.signatureUrl;
+              });
+            }
+            
+            // Stamp
+            if (applyStampOnVersion && user.stampUrl) {
+              const stampImg = new Image();
+              stampImg.crossOrigin = 'anonymous';
+              await new Promise((resolve) => {
+                stampImg.onload = () => {
+                  const stampW = canvas.width * 0.22;
+                  const stampH = (stampImg.height / stampImg.width) * stampW;
+                  ctx.drawImage(stampImg, 30, canvas.height - stampH - 30, stampW, stampH);
+                  resolve(true);
+                };
+                stampImg.src = user.stampUrl;
+              });
+            }
+            
+            const processedBase64 = canvas.toDataURL('image/jpeg', 0.90);
+            const currentVersions = previewItem.versions || [];
+            const nextVerNum = currentVersions.length + 1;
+            
+            const newVersion = {
+              version: nextVerNum,
+              fileUrl: processedBase64,
+              annotation: versionAnnotation || `Version ${nextVerNum} chargée`,
+              hasSignature: applySignatureOnVersion,
+              hasStamp: applyStampOnVersion,
+              createdBy: user.uid,
+              createdByName: user.displayName || 'Agent',
+              createdByRole: user.poste || 'DGI Agent',
+              createdAt: new Date().toISOString()
+            };
+            
+            const actionText = `Version v${nextVerNum} créée` + 
+              (applySignatureOnVersion ? ' (Signée électroniquement)' : '') + 
+              (applyStampOnVersion ? ' (Cachet administratif apposé)' : '') + 
+              (versionAnnotation ? ` - Commentaire : "${versionAnnotation}"` : '');
+              
+            const logEntry = {
+              id: Math.random().toString(36).slice(-6),
+              authorName: user.displayName || 'Agent',
+              authorRole: user.poste || 'Agent DGI',
+              action: 'VERSION_AJOUTE',
+              description: actionText,
+              timestamp: new Date().toISOString()
+            };
+            
+            const updatedVersions = [...currentVersions, newVersion];
+            const updatedLogs = [...(previewItem.historyLogs || []), logEntry];
+            
+            await updateDoc(doc(db, 'ged_items', previewItem.id), {
+              versions: updatedVersions,
+              historyLogs: updatedLogs,
+              updatedAt: serverTimestamp()
+            });
+            
+            setPreviewItem(prev => prev ? { ...prev, versions: updatedVersions, historyLogs: updatedLogs } : null);
+            setSelectedPreviewVersion(nextVerNum);
+            
+            // Reset input form
+            setApplySignatureOnVersion(false);
+            setApplyStampOnVersion(false);
+            setVersionAnnotation('');
+            setIsUploadingVersion(false);
+            setStatusText(`Version ${nextVerNum} enregistrée avec succès !`);
+          }
+        };
+        img.src = base64Url;
+      };
+      reader.readAsDataURL(file);
+    } catch (err) {
+      console.error(err);
+      setStatusText("Erreur lors du traitement de la nouvelle version.");
+      setIsUploadingVersion(false);
     }
   };
 
@@ -810,6 +1191,13 @@ export default function GedPage() {
                   <UploadCloud size={14} /> Téléverser un document
                   <input type="file" className="hidden" onChange={handleFileUpload} />
                 </label>
+
+                <button 
+                  onClick={() => setShowScanner(true)}
+                  className="px-5 py-3 bg-[#0284C7] hover:bg-[#0369A1] text-white rounded-2xl text-[9px] font-black uppercase tracking-wider active:scale-95 transition-all shadow-lg shadow-sky-600/15 flex items-center gap-2 cursor-pointer"
+                >
+                  <Camera size={14} /> Numériser un document
+                </button>
               </>
             )}
 
@@ -1024,6 +1412,12 @@ export default function GedPage() {
                       <UploadCloud size={14} /> Téléverser un document
                       <input type="file" className="hidden" onChange={handleFileUpload} />
                     </label>
+                    <button 
+                      onClick={() => setShowScanner(true)}
+                      className="flex-1 px-4 py-3 bg-[#0284C7] hover:bg-[#0369A1] text-white rounded-xl text-[9px] font-black uppercase tracking-widest hover:brightness-110 active:scale-95 transition-all shadow-lg shadow-sky-600/15 flex items-center justify-center gap-2"
+                    >
+                      <Camera size={14} /> Numériser un document
+                    </button>
                     <button 
                       onClick={() => setShowCreateFolder(true)}
                       className="flex-1 px-4 py-3 bg-white border border-gray-200 text-[#2C3E50] rounded-xl text-[9px] font-black uppercase tracking-widest hover:border-primary hover:text-primary transition-all shadow-sm flex items-center justify-center gap-2"
@@ -1780,72 +2174,404 @@ export default function GedPage() {
 
       {/* MODAL: File Preview Viewer */}
       {previewItem && (
-        <div className="fixed inset-0 z-[160] flex items-center justify-center bg-gray-900/80 backdrop-blur-md p-4">
-          <div className="bg-white rounded-[3.5rem] shadow-2xl max-w-4xl w-full h-[85vh] border border-white flex flex-col overflow-hidden">
+        <div className="fixed inset-0 z-[160] flex items-center justify-center bg-gray-900/80 backdrop-blur-md p-2 md:p-4">
+          <div className="bg-white rounded-[3rem] shadow-2xl max-w-7xl w-full h-[90vh] border border-white flex flex-col overflow-hidden animate-in zoom-in duration-300">
+            
             {/* Modal Header */}
-            <div className="p-6 border-b border-gray-100 flex items-center justify-between bg-gray-50/50">
+            <div className="p-5 md:p-6 border-b border-gray-100 flex items-center justify-between bg-gray-50/50">
               <div className="flex items-center gap-3">
-                <span className="text-2xl">{getFileIcon(previewItem.extension)}</span>
+                <span className="text-3xl">{getFileIcon(previewItem.extension)}</span>
                 <div className="min-w-0">
-                  <h3 className="text-sm font-black text-[#2C3E50] uppercase truncate max-w-[300px] md:max-w-xl">{previewItem.name}</h3>
-                  <p className="text-[9px] text-gray-400 font-bold uppercase tracking-widest">
-                    Par : {previewItem.createdBy?.displayName} • {(previewItem.fileSize ? (previewItem.fileSize / 1024).toFixed(1) : 0)} Ko
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="text-sm font-black text-[#2C3E50] uppercase truncate max-w-[200px] md:max-w-md">{previewItem.name}</h3>
+                    <span className={cn(
+                      "px-2.5 py-0.5 rounded-full text-[9px] font-black uppercase tracking-[0.05em]",
+                      (previewItem.status || 'Nouveau') === 'Nouveau' && 'bg-blue-50 text-blue-700 border border-blue-100',
+                      (previewItem.status || 'Nouveau') === 'En cours' && 'bg-amber-50 text-amber-700 border border-amber-100',
+                      ((previewItem.status || 'Nouveau') === 'Terminé' || (previewItem.status || 'Nouveau') === 'Terminé / Envoyé') && 'bg-green-50 text-green-700 border border-green-100',
+                      (previewItem.status || 'Nouveau') === 'Archivé' && 'bg-gray-100 text-gray-700 border border-gray-200'
+                    )}>
+                      {previewItem.status === 'Terminé' ? 'Terminé / Envoyé' : (previewItem.status || 'Nouveau')}
+                    </span>
+                  </div>
+                  <p className="text-[9px] text-gray-400 font-bold uppercase tracking-widest mt-0.5">
+                    ID Dossier #GED-{previewItem.id?.slice(0,8).toUpperCase()} • Créateur : {previewItem.createdBy?.displayName || 'DGI'}
                   </p>
                 </div>
               </div>
               <div className="flex items-center gap-3">
                 <a 
-                  href={previewItem.fileUrl} 
+                  href={selectedPreviewVersion && previewItem.versions ? (previewItem.versions.find(v => v.version === selectedPreviewVersion)?.fileUrl || previewItem.fileUrl) : previewItem.fileUrl} 
                   download={previewItem.name}
-                  className="p-3 bg-primary text-white rounded-2xl text-[9px] font-black uppercase tracking-widest shadow-lg shadow-primary/20 hover:brightness-110"
+                  className="p-3 bg-primary text-white rounded-2xl text-[9px] font-black uppercase tracking-widest shadow-lg shadow-primary/20 hover:brightness-110 flex items-center gap-1.5"
                   title="Télécharger l'original"
                 >
-                  <Download size={16} />
+                  <Download size={14} />
+                  <span className="hidden sm:inline">Télécharger</span>
                 </a>
                 <button 
-                  onClick={() => setPreviewItem(null)}
-                  className="p-3 bg-gray-100 text-gray-500 hover:text-red-500 rounded-2xl"
+                  onClick={() => {
+                    setPreviewItem(null);
+                    setSelectedPreviewVersion(null);
+                  }}
+                  className="p-3 bg-gray-100 text-gray-500 hover:text-red-500 rounded-2xl cursor-pointer"
                 >
                   <X size={16} />
                 </button>
               </div>
             </div>
 
-            {/* Modal Content - Viewer box */}
-            <div className="flex-1 bg-gray-900 p-6 flex items-center justify-center overflow-auto relative">
-              {['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(previewItem.extension?.toLowerCase() || '') ? (
-                <img 
-                  src={previewItem.fileUrl} 
-                  className="max-h-full max-w-full object-contain rounded-xl select-none" 
-                  alt={previewItem.name} 
-                  referrerPolicy="no-referrer"
-                />
-              ) : previewItem.extension?.toLowerCase() === 'pdf' ? (
-                /* Dynamic standard sandboxed iframe embed for real PDFs! */
-                <iframe 
-                  src={previewItem.fileUrl}
-                  className="w-full h-full bg-white rounded-2xl shadow-xl"
-                  title={previewItem.name}
-                />
-              ) : (
-                /* Other document types visual details card */
-                <div className="bg-white p-10 rounded-[2.5rem] max-w-md w-full text-center border shadow-2xl">
-                  <div className="text-5xl mb-6 flex justify-center">
-                    {getFileIcon(previewItem.extension)}
-                  </div>
-                  <h4 className="text-base font-black text-[#2C3E50] uppercase mb-2 truncate">{previewItem.name}</h4>
-                  <p className="text-xs text-gray-400 mb-8">
-                    Le format de ce fichier (.{(previewItem.extension || '').toUpperCase()}) ne supporte pas l'aperçu instantané en ligne.
-                  </p>
-                  <a 
-                    href={previewItem.fileUrl} 
-                    download={previewItem.name}
-                    className="inline-flex items-center gap-2 px-8 py-4 bg-primary text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-xl shadow-primary/20 hover:scale-105 active:scale-95 transition-all"
-                  >
-                    <Download size={14} /> Télécharger pour l'ouvrir
-                  </a>
+            {/* Split view content: Left (Preview Box), Right (Dossier Suite Sidebar) */}
+            <div className="flex-1 flex flex-col lg:flex-row overflow-hidden bg-gray-50">
+              
+              {/* Left Column: Deep frame previewer */}
+              <div className="flex-1 bg-zinc-950 p-4 md:p-6 flex flex-col items-center justify-center relative overflow-hidden select-none border-r border-gray-100 h-[40vh] lg:h-auto overflow-y-auto">
+                <div className="absolute top-4 left-4 bg-black/60 backdrop-blur-sm px-3.5 py-1.5 rounded-full z-10 text-[9px] font-black uppercase tracking-[0.1em] text-neutral-300 border border-white/15">
+                  Aperçu : {selectedPreviewVersion ? `Version V${selectedPreviewVersion}` : 'Image d\'origine'}
                 </div>
-              )}
+
+                {['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(previewItem.extension?.toLowerCase() || '') ? (
+                  <img 
+                    src={selectedPreviewVersion && previewItem.versions ? (previewItem.versions.find(v => v.version === selectedPreviewVersion)?.fileUrl || previewItem.fileUrl) : previewItem.fileUrl} 
+                    className="max-h-full max-w-full object-contain rounded-2xl select-none" 
+                    alt={previewItem.name} 
+                    referrerPolicy="no-referrer"
+                  />
+                ) : previewItem.extension?.toLowerCase() === 'pdf' ? (
+                  <iframe 
+                    src={selectedPreviewVersion && previewItem.versions ? (previewItem.versions.find(v => v.version === selectedPreviewVersion)?.fileUrl || previewItem.fileUrl) : previewItem.fileUrl}
+                    className="w-full h-full bg-white rounded-2xl shadow-xl min-h-[400px]"
+                    title={previewItem.name}
+                  />
+                ) : (
+                  <div className="bg-white p-8 rounded-[2.5rem] max-w-sm w-full text-center border shadow-2xl">
+                    <div className="text-5xl mb-4 flex justify-center">{getFileIcon(previewItem.extension)}</div>
+                    <h4 className="text-base font-black text-[#2C3E50] uppercase mb-1 truncate">{previewItem.name}</h4>
+                    <p className="text-xs text-gray-400 mb-6">
+                      Le format de ce fichier (.{(previewItem.extension || '').toUpperCase()}) ne supporte pas l'aperçu instantané en ligne.
+                    </p>
+                    <a 
+                      href={previewItem.fileUrl} 
+                      download={previewItem.name}
+                      className="inline-flex items-center gap-2 px-6 py-3 bg-primary text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-105 transition-all shadow-lg"
+                    >
+                      <Download size={12} /> Télécharger
+                    </a>
+                  </div>
+                )}
+              </div>
+
+              {/* Right Column: Life-Cycle control dashboard workspace */}
+              <div className="w-full lg:w-[420px] bg-white flex flex-col overflow-y-auto border-l border-gray-100 p-5 md:p-6 gap-6 custom-scrollbar">
+                
+                {/* 1. STATUS TRANSITION PANEL */}
+                <div className="bg-gray-50/50 p-4 rounded-3xl border border-gray-100/80">
+                  <h4 className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-3">Statut & Étape de Traitement</h4>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(['Nouveau', 'En cours', 'Terminé / Envoyé', 'Archivé'] as const).map((st) => {
+                      const isActive = st === 'Terminé / Envoyé'
+                        ? ((previewItem.status || 'Nouveau') === 'Terminé / Envoyé' || (previewItem.status || 'Nouveau') === 'Terminé')
+                        : (previewItem.status || 'Nouveau') === st;
+                      return (
+                        <button
+                          key={st}
+                          onClick={() => handleUpdateStatus(previewItem.id, st)}
+                          className={cn(
+                            "py-2 px-3 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border text-center flex items-center justify-center gap-1.5 cursor-pointer",
+                            isActive 
+                              ? st === 'Nouveau' ? 'bg-blue-600 text-white border-blue-600 shadow-md shadow-blue-600/10' :
+                                st === 'En cours' ? 'bg-amber-500 text-white border-amber-500 shadow-md shadow-amber-500/10' :
+                                st === 'Terminé / Envoyé' ? 'bg-green-600 text-white border-green-600 shadow-md shadow-green-600/10' :
+                                'bg-gray-600 text-white border-gray-600 shadow-md shadow-gray-400/10'
+                              : 'bg-white text-gray-500 border-gray-200 hover:bg-gray-50'
+                          )}
+                        >
+                          {isActive && <div className="w-1.5 h-1.5 bg-white rounded-full animate-ping" />}
+                          {st}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* 1.1 LINKED CONVERSATION PANEL */}
+                {user?.role !== 'contributor' && (
+                  <div className="bg-gray-50/50 p-4 rounded-3xl border border-gray-100/80">
+                    <h4 className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-3">Liaison de Conversation Contribuable</h4>
+                    
+                    {previewItem.linkedConversationId ? (
+                      (() => {
+                        const linkedConv = conversations.find(c => c.id === previewItem.linkedConversationId);
+                        return (
+                          <div className="bg-white p-3 rounded-2xl border border-teal-100 flex flex-col gap-2">
+                            <div className="flex items-start justify-between">
+                              <div className="flex items-center gap-2">
+                                <div className="w-2 h-2 rounded-full bg-teal-500 animate-pulse" />
+                                <span className="text-[10px] font-black uppercase tracking-widest text-[#2C3E50]">Dossier Lié Activement</span>
+                              </div>
+                              <button 
+                                onClick={() => handleUnlinkFromConversation(previewItem.id)}
+                                className="text-[9px] font-black uppercase tracking-widest text-red-500 hover:text-red-700 cursor-pointer"
+                              >
+                                Détacher
+                              </button>
+                            </div>
+                            
+                            <div className="text-xs text-gray-700 font-medium">
+                              {linkedConv ? (
+                                <>
+                                  <p className="font-extrabold text-gray-900">{linkedConv.contributorName || linkedConv.companyName || 'Contribuable Inconnu'}</p>
+                                  <p className="text-gray-500 text-[10px] truncate">Sujet : {linkedConv.subject}</p>
+                                  <p className="text-gray-400 text-[9px] font-mono mt-1">ID Conv: #{linkedConv.id.slice(0, 8).toUpperCase()}</p>
+                                </>
+                              ) : (
+                                <p className="text-amber-600 font-bold">Liaison active (ID conversation: {previewItem.linkedConversationId.slice(0, 8).toUpperCase()})</p>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })()
+                    ) : (
+                      <div className="flex flex-col gap-2">
+                        <p className="text-[10px] text-gray-400">Associez ce document administratif à un fil de discussion d'un contribuable pour automatiser notifications et clôtures.</p>
+                        
+                        <div className="relative">
+                          <input 
+                            type="text" 
+                            placeholder="Rechercher un contribuable ou sujet..." 
+                            value={linkingSearch}
+                            onChange={(e) => setLinkingSearch(e.target.value)}
+                            className="w-full px-3 py-1.5 pr-8 bg-white border border-gray-200 rounded-xl text-xs font-semibold focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary"
+                          />
+                          <Search size={14} className="absolute right-2.5 top-2.5 text-gray-400" />
+                        </div>
+                        
+                        <div className="flex flex-col gap-1.5 max-h-40 overflow-y-auto custom-scrollbar mt-1 bg-white rounded-2xl border border-gray-100 p-1.5">
+                          {conversations
+                            .filter(conv => {
+                              const searchLower = linkingSearch.toLowerCase();
+                              return (
+                                (conv.contributorName?.toLowerCase() || '').includes(searchLower) ||
+                                (conv.companyName?.toLowerCase() || '').includes(searchLower) ||
+                                (conv.subject?.toLowerCase() || '').includes(searchLower)
+                              );
+                            })
+                            .map(conv => (
+                              <button
+                                key={conv.id}
+                                onClick={() => handleLinkToConversation(previewItem.id, conv.id)}
+                                className="w-full text-left p-2 hover:bg-gray-50 rounded-lg transition-colors border border-transparent hover:border-gray-100 flex flex-col text-xs cursor-pointer"
+                              >
+                                <span className="font-bold text-gray-800 truncate">
+                                  {conv.contributorName || conv.companyName || 'Contribuable'}
+                                </span>
+                                <span className="text-[10px] text-gray-400 truncate">
+                                  {conv.subject}
+                                </span>
+                              </button>
+                            ))}
+                          {conversations.filter(conv => {
+                            const searchLower = linkingSearch.toLowerCase();
+                            return (
+                              (conv.contributorName?.toLowerCase() || '').includes(searchLower) ||
+                              (conv.companyName?.toLowerCase() || '').includes(searchLower) ||
+                              (conv.subject?.toLowerCase() || '').includes(searchLower)
+                            );
+                          }).length === 0 && (
+                            <p className="text-center py-4 text-[10px] font-bold text-gray-400">Aucune conversation active trouvée</p>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* 2. PERSISTENT HISTORICAL VERSIONS */}
+                <div className="bg-gray-50/50 p-4 rounded-3xl border border-gray-100/80">
+                  <h4 className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-3">Historique des Versions</h4>
+                  <div className="flex flex-col gap-2">
+                    {/* Source / V0 */}
+                    <button
+                      onClick={() => setSelectedPreviewVersion(null)}
+                      className={cn(
+                        "w-full p-2.5 rounded-xl border text-left flex items-center justify-between transition-all cursor-pointer",
+                        selectedPreviewVersion === null ? 'bg-primary/5 border-primary/20 ring-1 ring-primary' : 'bg-white border-gray-100 hover:bg-gray-50'
+                      )}
+                    >
+                      <div>
+                        <p className="text-xs font-black text-[#2C3E50]">Document original (V0)</p>
+                        <p className="text-[9px] text-gray-400 font-bold uppercase tracking-wider">Source d'entrée numérisée</p>
+                      </div>
+                      <span className="text-[9px] font-black px-2 py-0.5 bg-gray-100 text-gray-600 rounded-md">Original</span>
+                    </button>
+
+                    {/* Versions arrays */}
+                    {previewItem.versions?.map((ver) => (
+                      <button
+                        key={ver.version}
+                        onClick={() => setSelectedPreviewVersion(ver.version)}
+                        className={cn(
+                          "w-full p-2.5 rounded-xl border text-left flex items-center justify-between transition-all cursor-pointer",
+                          selectedPreviewVersion === ver.version ? 'bg-primary/5 border-primary/20 ring-1 ring-primary' : 'bg-white border-gray-100 hover:bg-gray-50'
+                        )}
+                      >
+                        <div>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <p className="text-xs font-black text-[#2C3E50]">Version {ver.version}</p>
+                            {ver.hasSignature && <span className="text-[8px] bg-slate-100 text-slate-800 font-bold px-1 py-0.2 rounded">Signé</span>}
+                            {ver.hasStamp && <span className="text-[8px] bg-cyan-100 text-cyan-800 font-bold px-1 py-0.2 rounded">Cacheté</span>}
+                          </div>
+                          <p className="text-[9px] text-gray-400 truncate max-w-[240px] italic">"{ver.annotation}"</p>
+                        </div>
+                        <span className="text-[9px] text-gray-400 font-bold">V{ver.version}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 3. SIGNATURE & STAMP COLLABORATIVE UPLOAD VERSION */}
+                <div className="bg-gray-50/50 p-4 rounded-3xl border border-gray-100/80">
+                  <h4 className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-2">Viser, Signer & Publier une Nouvelle Version</h4>
+                  <p className="text-[10px] text-gray-500 mb-3 leading-relaxed">
+                    Ajoutez une annotation ou appliquez directement vos éléments d'authentification enregistrés pour sceller cette nouvelle version.
+                  </p>
+
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-4">
+                      {/* Signature check */}
+                      <label className={cn(
+                        "flex-1 items-center gap-2 p-2 rounded-xl border flex cursor-pointer select-none text-[10px] font-bold uppercase justify-center",
+                        applySignatureOnVersion ? 'bg-teal-55 border-teal-200 text-teal-800 font-black' : 'bg-white border-gray-100 text-gray-450',
+                        !user?.signatureUrl && 'opacity-30 cursor-not-allowed'
+                      )}>
+                        <input 
+                          type="checkbox"
+                          disabled={!user?.signatureUrl}
+                          checked={applySignatureOnVersion}
+                          onChange={(e) => setApplySignatureOnVersion(e.target.checked)}
+                          className="accent-teal-600 rounded"
+                        />
+                        Signature ✍️
+                      </label>
+
+                      {/* Stamp check */}
+                      <label className={cn(
+                        "flex-1 items-center gap-2 p-2 rounded-xl border flex cursor-pointer select-none text-[10px] font-bold uppercase justify-center",
+                        applyStampOnVersion ? 'bg-amber-55 border-amber-200 text-amber-800 font-black' : 'bg-white border-gray-100 text-gray-450',
+                        !user?.stampUrl && 'opacity-30 cursor-not-allowed'
+                      )}>
+                        <input 
+                          type="checkbox"
+                          disabled={!user?.stampUrl}
+                          checked={applyStampOnVersion}
+                          onChange={(e) => setApplyStampOnVersion(e.target.checked)}
+                          className="accent-amber-600 rounded"
+                        />
+                        Cachet 🏢
+                      </label>
+                    </div>
+
+                    {!user?.signatureUrl && !user?.stampUrl && (
+                      <p className="text-[9px] text-red-500 font-medium leading-tight">
+                        ⚠️ Rendez-vous dans votre Profil pour téléverser & détourer votre signature/cachet afin d'activer ces options d'authentification officielle.
+                      </p>
+                    )}
+
+                    <div>
+                      <input 
+                        type="text"
+                        className="w-full px-3 py-2 bg-white border border-gray-100 rounded-xl text-xs font-bold outline-none shadow-sm focus:border-primary placeholder-gray-405"
+                        placeholder="Annotation (ex: Validé pour transmission...)"
+                        value={versionAnnotation}
+                        onChange={(e) => setVersionAnnotation(e.target.value)}
+                      />
+                    </div>
+
+                    <label className={cn(
+                      "w-full py-2.5 px-4 bg-[#2C3E50] text-white text-[10px] font-black uppercase tracking-widest rounded-xl flex items-center justify-center gap-2 cursor-pointer transition-all hover:bg-opacity-95 shadow-lg",
+                      isUploadingVersion && 'opacity-50 pointer-events-none'
+                    )}>
+                      {isUploadingVersion ? <Loader2 className="animate-spin text-white" size={14} /> : <CheckCircle2 size={14} />}
+                      {isUploadingVersion ? 'Traitement...' : 'Publier nouvelle version'}
+                      <input 
+                        type="file" 
+                        accept="image/*" 
+                        className="hidden" 
+                        onChange={handleUploadNewVersion}
+                        disabled={isUploadingVersion}
+                      />
+                    </label>
+                  </div>
+                </div>
+
+                {/* 4. IMMUTABLE CHRONOLOGICAL LOGS & DISCUSSION THREAD */}
+                <div className="flex-1 min-h-[200px] flex flex-col border border-gray-150 rounded-3xl overflow-hidden bg-gray-50/20">
+                  <div className="p-3 bg-gray-100/60 border-b border-gray-150 flex items-center justify-between">
+                    <h4 className="text-[10px] font-black text-[#2C3E50] uppercase tracking-wider">Discussion & Historique Inviolable</h4>
+                    <span className="text-[8px] font-black bg-emerald-110 text-emerald-800 uppercase px-1.5 py-0.5 rounded">Scellé</span>
+                  </div>
+
+                  {/* Logs stream timeline list */}
+                  <div className="flex-1 p-4 overflow-y-auto space-y-4 max-h-[220px] custom-scrollbar">
+                    
+                    {/* Default initial create audit trail if logs are blank */}
+                    <div className="relative pl-6 pb-2 border-l border-dashed border-gray-200">
+                      <div className="absolute -left-1.5 top-1.5 w-3 h-3 bg-blue-600 rounded-full border border-white shadow shadow-blue-500/20" />
+                      <div>
+                        <div className="flex items-center gap-1.5">
+                          <p className="text-[10px] font-black text-[#2C3E50]">{previewItem.createdBy?.displayName || 'DGI'}</p>
+                          <span className="text-[8px] bg-blue-50 text-blue-800 font-bold px-1 rounded uppercase">Création</span>
+                        </div>
+                        <p className="text-[10px] text-gray-500 mt-0.5 leading-tight">Numérisation et création du dossier initial.</p>
+                        <p className="text-[8px] text-gray-400 mt-1 font-mono">
+                          {previewItem.createdAt ? (previewItem.createdAt as any).toDate ? (previewItem.createdAt as any).toDate().toLocaleString() : new Date().toLocaleString() : ''}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Timeline elements */}
+                    {previewItem.historyLogs?.map((log) => (
+                      <div key={log.id} className="relative pl-6 pb-2 border-l border-dashed border-gray-200 select-text">
+                        <div className={cn(
+                          "absolute -left-1.5 top-1.5 w-3 h-3 rounded-full border border-white shadow",
+                          log.action === 'CHANGEMENT_STATUT' ? 'bg-amber-500' :
+                          log.action === 'VERSION_AJOUTE' ? 'bg-sky-500' : 'bg-gray-400'
+                        )} />
+                        <div>
+                          <div className="flex items-center gap-1.5">
+                            <p className="text-[10px] font-black text-[#2C3E50]">{log.authorName}</p>
+                            <span className="text-[8px] bg-gray-100 text-gray-600 px-1 rounded uppercase tracking-wide font-black">{log.authorRole}</span>
+                          </div>
+                          <p className="text-[10px] text-gray-650 mt-0.5 whitespace-pre-wrap leading-tight">{log.description}</p>
+                          <p className="text-[8px] text-gray-400 mt-0.5 font-mono">{new Date(log.timestamp).toLocaleString()}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Comment Input */}
+                  <div className="p-3 border-t border-gray-150 bg-white flex gap-2">
+                    <input 
+                      type="text" 
+                      className="flex-1 px-3 py-2 border border-gray-100 rounded-xl text-xs font-bold outline-none bg-gray-50/50"
+                      placeholder="Commentaire ou annotation..."
+                      value={commentInput}
+                      onChange={(e) => setCommentInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleAddComment(previewItem.id);
+                      }}
+                    />
+                    <button 
+                      onClick={() => handleAddComment(previewItem.id)}
+                      className="px-3 py-2 bg-primary text-white text-[10px] font-black uppercase tracking-widest rounded-xl hover:brightness-115 cursor-pointer"
+                    >
+                      Poster
+                    </button>
+                  </div>
+                </div>
+
+              </div>
+
             </div>
           </div>
         </div>
@@ -2131,6 +2857,16 @@ export default function GedPage() {
           </div>
         </div>
       )}
+
+      <AnimatePresence>
+        {showScanner && (
+          <DocumentScanner 
+            onClose={() => setShowScanner(false)} 
+            onScanComplete={importScannedFileToGed} 
+            title="Numériseur de Dossiers GED"
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 }

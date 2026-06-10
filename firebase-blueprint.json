@@ -116,6 +116,7 @@
         "fileUrl": { "type": "string" },
         "fileSize": { "type": "number" },
         "isDeleted": { "type": "boolean" },
+        "extractedText": { "type": "string" },
         "createdBy": { "type": "object" },
         "createdAt": { "type": "string", "format": "date-time" }
       },

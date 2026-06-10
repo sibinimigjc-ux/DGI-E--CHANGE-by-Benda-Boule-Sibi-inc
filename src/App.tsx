@@ -124,6 +124,8 @@ const playNotificationSound = () => {
 
 import * as Dialog from '@radix-ui/react-dialog';
 import GedPage from './GedPage';
+import DossiersInternesPage from './DossiersInternesPage';
+import DocumentScanner from './DocumentScanner';
 import { AppUser, DEFAULT_THEME, ThemeConfig, Exchange, InternalMessage, Attachment, Conversation, Invitation, UserRole, AgentPermission } from './types';
 import { 
   Building2, 
@@ -149,6 +151,7 @@ import {
   RefreshCcw,
   Shield,
   FileText,
+  FolderGit,
   MapPin,
   Lock,
   Eye,
@@ -276,7 +279,7 @@ async function compressBrandingImage(file: File, type: 'logo' | 'favicon'): Prom
   });
 }
 
-async function uploadFile(
+export async function uploadFile(
   file: File, 
   path: string, 
   onProgress?: (p: number) => void, 
@@ -1326,6 +1329,7 @@ const AppShell = ({ children }: { children: React.ReactNode }) => {
                 <SidebarLink to="/admin" icon={Layers} label="Vue Panoramique" active={location.pathname === '/admin'} />
                 <SidebarLink to="/messaging" icon={Mail} label="Conversations Contribuables" active={location.pathname === '/messaging'} />
                 <SidebarLink to="/internal" icon={MessageSquare} label="Conversations Staff" active={location.pathname === '/internal'} />
+                <SidebarLink to="/dossiers-internes" icon={FolderGit} label="Traitement Dossiers" active={location.pathname === '/dossiers-internes'} />
                 <SidebarLink to="/ged" icon={HardDrive} label="Gestion GED" active={location.pathname === '/ged'} />
                 {(user?.role === 'admin' || user?.role === 'agent' || hasPermission(user, 'tax_consultation') || hasPermission(user, 'deletion') || (user as any)?.isSuperContribuable) && (
                     <SidebarLink to="/directory" icon={Users} label="Annuaire National" active={location.pathname === '/directory'} />
@@ -1450,6 +1454,9 @@ const DashboardPage = () => {
 
         const unsubConv = onSnapshot(qConv, (snap) => {
             let all = snap.docs.map(d => ({ id: d.id, ...d.data() } as Conversation));
+            if (!isSuperAdmin) {
+                all = all.filter(c => !c.isClosed && c.status !== 'closed');
+            }
             if (!isSuperAdmin && (user.role === 'agent' || user.role === 'admin')) {
                 all.sort((a, b) => {
                     const tA = a.lastUpdate?.toMillis ? a.lastUpdate.toMillis() : (a.lastUpdate?.seconds ? a.lastUpdate.seconds * 1000 : 0);
@@ -1812,6 +1819,7 @@ const MessagingPage = () => {
     // Compose State
     const [composeData, setComposeData] = useState({ subject: '', body: '', receiverId: 'global', searchTaxpayer: '', conversationId: '', isInternal: false });
     const [attachments, setAttachments] = useState<File[]>([]);
+    const [showChatScanner, setShowChatScanner] = useState(false);
     const [uploadProgress, setUploadProgress] = useState<number[]>([]);
     const [uploadedFiles, setUploadedFiles] = useState<(Attachment | null)[]>([]);
     const [uploadErrors, setUploadErrors] = useState<(string | null)[]>([]);
@@ -1820,6 +1828,52 @@ const MessagingPage = () => {
     const uploadTasksRef = useRef<Map<number, any>>(new Map());
 
     const isFirstConvLoadRef = useRef(true);
+
+    const addScannedFileToConversation = async (file: File) => {
+        const targetIdx = attachments.length;
+        setAttachments(prev => [...prev, file]);
+        setUploadProgress(prev => [...prev, 5]);
+        setUploadedFiles(prev => [...prev, null]);
+        setUploadErrors(prev => [...prev, null]);
+        setShowChatScanner(false);
+        
+        const uploadPromise = uploadFile(file, `conversations/${user?.uid || 'anonymous'}`, (p) => {
+            setUploadProgress(curr => {
+                const cp = [...curr];
+                if (cp[targetIdx] !== undefined) cp[targetIdx] = p;
+                return cp;
+            });
+        }, (task) => {
+            uploadTasksRef.current.set(targetIdx, task);
+        }).then(url => {
+            const result: Attachment = { 
+                url, 
+                name: file.name, 
+                type: file.type,
+                size: file.size,
+                extractedText: (file as any).extractedText || '',
+                createdAt: new Date().toISOString()
+            };
+            
+            setUploadedFiles(curr => {
+                const cp = [...curr];
+                if (cp[targetIdx] !== undefined) cp[targetIdx] = result;
+                return cp;
+            });
+            
+            return result;
+        }).catch(err => {
+            console.error("Scanned file upload failure", err);
+            setUploadErrors(curr => {
+                const cp = [...curr];
+                if (cp[targetIdx] !== undefined) cp[targetIdx] = "Échec";
+                return cp;
+            });
+            throw err;
+        });
+
+        uploadPromisesRef.current.set(targetIdx, uploadPromise);
+    };
 
     useEffect(() => {
         if (!user) return;
@@ -1844,6 +1898,9 @@ const MessagingPage = () => {
         const unsub = onSnapshot(q, 
             (snap) => {
                 let list = snap.docs.map(d => ({ id: d.id, ...d.data() } as Conversation));
+                if (!isSuperAdmin) {
+                    list = list.filter(c => !c.isClosed && c.status !== 'closed');
+                }
                 if (!isSuperAdmin && (user.role === 'admin' || user.role === 'agent')) {
                     list.sort((a, b) => {
                         const tA = a.lastUpdate?.toMillis ? a.lastUpdate.toMillis() : (a.lastUpdate?.seconds ? a.lastUpdate.seconds * 1000 : 0);
@@ -2056,6 +2113,28 @@ const MessagingPage = () => {
             alert(`Erreur de transmission: ${e.message}`);
             setUploading(false);
             setStatus('');
+        }
+    };
+
+    const handleCloseConversation = async (conv: Conversation) => {
+        if (!conv || !user) return;
+        setUploading(true);
+        setStatus("Clôture définitive du dossier de conversation...");
+        try {
+            await updateDoc(doc(db, 'conversations', conv.id), {
+                isClosed: true,
+                status: 'closed',
+                closedAt: serverTimestamp(),
+                closedBy: user.displayName || 'Agent CERTIFIÉ'
+            });
+            setSelectedConv(null);
+            setStatus("Le dossier de conversation a été définitivement clôturé.");
+        } catch (err) {
+            console.error(err);
+            setStatus("Erreur lors de la clôture.");
+        } finally {
+            setUploading(false);
+            setTimeout(() => setStatus(''), 3000);
         }
     };
 
@@ -2600,6 +2679,17 @@ const MessagingPage = () => {
                                             </div>
                                             <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest text-center px-4">Glisser ou Sélectionner</p>
                                         </label>
+
+                                        <button 
+                                            type="button"
+                                            onClick={() => setShowChatScanner(true)}
+                                            className="w-full mt-4 flex items-center justify-center gap-3 p-6 bg-indigo-50 border border-indigo-100 rounded-[2rem] text-indigo-700 hover:bg-[#EEF2F6] transition-all font-black text-[10px] uppercase tracking-wider shadow-sm cursor-pointer"
+                                        >
+                                            <div className="p-2 bg-white rounded-xl text-indigo-650 shadow-sm shrink-0">
+                                                <Camera size={16} />
+                                            </div>
+                                            <span>Numériser un document</span>
+                                        </button>
                                     </div>
                                 </div>
 
@@ -2787,6 +2877,16 @@ const MessagingPage = () => {
 
                             {(user?.role === 'admin' || user?.role === 'agent') && (
                                 <button 
+                                    onClick={() => handleCloseConversation(selectedConv)}
+                                    className="px-6 py-3 md:px-10 md:py-4 bg-amber-600 hover:bg-amber-700 text-white font-black text-[9px] md:text-[10px] uppercase tracking-widest rounded-xl md:rounded-2xl shadow-xl shadow-amber-200/40 flex items-center gap-2 transition-all cursor-pointer"
+                                    title="Clôturer définitivement ce dossier de conversation"
+                                >
+                                    <CheckCircle2 size={14} /> Clôturer le dossier
+                                </button>
+                            )}
+
+                            {(user?.role === 'admin' || user?.role === 'agent') && (
+                                <button 
                                     onClick={() => {
                                         if (selectedConv?.agentId && selectedConv.agentId !== user.uid) {
                                             const agent = agents.find(a => a.uid === selectedConv.agentId);
@@ -2933,6 +3033,14 @@ const MessagingPage = () => {
                     </div>
                 </div>
             )}
+
+            {showChatScanner && (
+                <DocumentScanner 
+                    onClose={() => setShowChatScanner(false)} 
+                    onScanComplete={addScannedFileToConversation} 
+                    title="Numériseur Chat Messagerie"
+                />
+            )}
         </div>
     );
 };
@@ -2955,7 +3063,11 @@ const SettingsPage = () => {
         tempPassword: 'Dgi2026!',
         role: 'agent' as UserRole,
         permissions: [] as AgentPermission[],
-        matricule: ''
+        matricule: '',
+        poste: '',
+        perimetre: 'gestionnaire' as 'secretariat' | 'gestionnaire' | 'admin_bureau' | 'superviseur' | 'superviseur_senior',
+        signatureUrl: '',
+        stampUrl: ''
     });
 
     useEffect(() => {
@@ -2967,6 +3079,91 @@ const SettingsPage = () => {
             );
         }
     }, [user, isAdminMode]);
+
+    const handleSaveUserSignatureOrStamp = async (type: 'signature' | 'stamp', dataUrl: string) => {
+        if (!user) return;
+        setLoading(true);
+        setStatus("Traitement de la signature/cachet...");
+        try {
+            const fieldName = type === 'signature' ? 'signatureUrl' : 'stampUrl';
+            await updateDoc(doc(db, 'users', user.uid), {
+                [fieldName]: dataUrl,
+                updatedAt: serverTimestamp()
+            });
+
+            // Also search if exists in agents collection and update
+            const agentsRef = collection(db, 'agents');
+            const agentSnap = await getDocs(query(agentsRef, where('email', '==', user.email.toLowerCase().trim())));
+            if (!agentSnap.empty) {
+                await updateDoc(agentSnap.docs[0].ref, {
+                    [fieldName]: dataUrl,
+                    updatedAt: serverTimestamp()
+                });
+            }
+
+            setStatus(`Votre ${type === 'signature' ? 'signature' : 'cachet'} a été mis à jour.`);
+        } catch (err) {
+            console.error(err);
+            setStatus("Erreur lors de l'enregistrement");
+        } finally {
+            setLoading(false);
+            setTimeout(() => setStatus(''), 3000);
+        }
+    };
+
+    const handleImageDeterage = (file: File, type: 'signature' | 'stamp') => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const img = new window.Image();
+            img.onload = () => {
+                try {
+                    const canvas = document.createElement('canvas');
+                    const maxW = 200;
+                    let w = img.width;
+                    let h = img.height;
+                    
+                    if (w > maxW) {
+                        h = Math.round((maxW / w) * h);
+                        w = maxW;
+                    }
+                    
+                    canvas.width = w;
+                    canvas.height = h;
+                    const ctx = canvas.getContext('2d');
+                    if (ctx) {
+                        ctx.drawImage(img, 0, 0, w, h);
+                        const imgData = ctx.getImageData(0, 0, w, h);
+                        const data = imgData.data;
+                        
+                        // Detour/threshold logic based on luminance:
+                        // Any pixel where luminance > 205 is made completely transparent
+                        for (let i = 0; i < data.length; i += 4) {
+                            const r = data[i];
+                            const g = data[i+1];
+                            const b = data[i+2];
+                            const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+                            if (luminance > 205) {
+                                data[i+3] = 0; // alpha set to 0 (100% transparent)
+                            }
+                        }
+                        ctx.putImageData(imgData, 0, 0);
+                        
+                        // Compress to webp at 0.6 quality, fallback to transparent png
+                        let processedBase64Url = canvas.toDataURL('image/webp', 0.6);
+                        if (!processedBase64Url.startsWith('data:image/webp')) {
+                            processedBase64Url = canvas.toDataURL('image/png');
+                        }
+                        handleSaveUserSignatureOrStamp(type, processedBase64Url);
+                    }
+                } catch (err) {
+                    console.error("Deterage image canvas error:", err);
+                    setStatus("Erreur lors du traitement du détourage.");
+                }
+            };
+            img.src = e.target?.result as string;
+        };
+        reader.readAsDataURL(file);
+    };
 
     const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>, type: 'logo' | 'favicon') => {
         const file = e.target.files?.[0];
@@ -3006,6 +3203,8 @@ const SettingsPage = () => {
             const tempPass = agentForm.tempPassword || 'Dgi2026!';
             const displayName = `${agentForm.firstName} ${agentForm.lastName}`.trim();
             const mat = agentForm.matricule.trim();
+            const upPoste = agentForm.poste.trim();
+            const upPerimetre = agentForm.perimetre || 'gestionnaire';
             
             const newUser: Partial<AppUser> = {
                 email: agentForm.email.toLowerCase().trim(),
@@ -3022,7 +3221,11 @@ const SettingsPage = () => {
                 isSetup: true,
                 assignedContribuables: [], // Requested field
                 internalPassword: tempPass,
-                lastLogin: null
+                lastLogin: null,
+                poste: upPoste,
+                perimetre: upPerimetre,
+                signatureUrl: agentForm.signatureUrl || '',
+                stampUrl: agentForm.stampUrl || ''
             };
 
             const agentRef = await addDoc(collection(db, 'users'), newUser);
@@ -3037,10 +3240,14 @@ const SettingsPage = () => {
                 uid: agentRef.id,
                 password: tempPass,
                 isNew: true,
-                matricule: mat
+                matricule: mat,
+                poste: upPoste,
+                perimetre: upPerimetre,
+                signatureUrl: agentForm.signatureUrl || '',
+                stampUrl: agentForm.stampUrl || ''
             });
             
-            setAgentForm({ firstName: '', lastName: '', email: '', phone: '', tempPassword: 'Dgi2026!', role: 'agent', permissions: [], matricule: '' });
+            setAgentForm({ firstName: '', lastName: '', email: '', phone: '', tempPassword: 'Dgi2026!', role: 'agent', permissions: [], matricule: '', poste: '', perimetre: 'gestionnaire', signatureUrl: '', stampUrl: '' });
             setStatus(`Profil Agent créé : ${agentForm.email}. Code d'activation temporaire: ${tempPass}.`);
         } catch (e) {
             console.error(e);
@@ -3077,6 +3284,11 @@ const SettingsPage = () => {
                 lastName = parts.slice(1).join(' ') || '';
             }
             
+            let _poste = agent.poste || '';
+            let _perimetre = agent.perimetre || 'gestionnaire';
+            let _signatureUrl = agent.signatureUrl || '';
+            let _stampUrl = agent.stampUrl || '';
+            
             if (!agentSnap.empty) {
                 const data = agentSnap.docs[0].data();
                 password = data.password || '';
@@ -3087,6 +3299,10 @@ const SettingsPage = () => {
                 if (data.permissions) {
                     permissions = data.permissions;
                 }
+                if (data.poste) _poste = data.poste;
+                if (data.perimetre) _perimetre = data.perimetre;
+                if (data.signatureUrl) _signatureUrl = data.signatureUrl;
+                if (data.stampUrl) _stampUrl = data.stampUrl;
             } else {
                 password = agent.internalPassword || 'Dgi2026!';
                 isNew = agent.isNew !== false;
@@ -3099,7 +3315,11 @@ const SettingsPage = () => {
                 matricule,
                 permissions,
                 internalPassword: password,
-                isNew: isNew
+                isNew: isNew,
+                poste: _poste,
+                perimetre: _perimetre as any,
+                signatureUrl: _signatureUrl,
+                stampUrl: _stampUrl
             });
             setEditAgentPassword(password);
             setEditAgentIsNew(isNew);
@@ -3119,7 +3339,11 @@ const SettingsPage = () => {
                 matricule: agent.matricule || '',
                 permissions: agent.permissions || [],
                 internalPassword: agent.internalPassword || 'Dgi2026!',
-                isNew: agent.isNew !== false
+                isNew: agent.isNew !== false,
+                poste: agent.poste || '',
+                perimetre: agent.perimetre || 'gestionnaire',
+                signatureUrl: agent.signatureUrl || '',
+                stampUrl: agent.stampUrl || ''
             });
             setEditAgentPassword(agent.internalPassword || 'Dgi2026!');
             setEditAgentIsNew(agent.isNew !== false);
@@ -3191,6 +3415,11 @@ const SettingsPage = () => {
             const updatedPhone = (editingAgent.phone || '').trim();
             const updatedMatricule = (editingAgent.matricule || '').trim();
 
+            const updatedPoste = (editingAgent.poste || '').trim();
+            const updatedPerimetre = editingAgent.perimetre || 'gestionnaire';
+            const updatedSignatureUrl = editingAgent.signatureUrl || '';
+            const updatedStampUrl = editingAgent.stampUrl || '';
+
             const userDocRef = doc(db, 'users', editingAgent.uid);
             await updateDoc(userDocRef, {
                 role: editingAgent.role,
@@ -3202,7 +3431,11 @@ const SettingsPage = () => {
                 lastName: updatedLastName,
                 displayName: updatedDisplayName,
                 phone: updatedPhone,
-                matricule: updatedMatricule
+                matricule: updatedMatricule,
+                poste: updatedPoste,
+                perimetre: updatedPerimetre,
+                signatureUrl: updatedSignatureUrl,
+                stampUrl: updatedStampUrl
             });
 
             const agentsRef = collection(db, 'agents');
@@ -3219,7 +3452,11 @@ const SettingsPage = () => {
                     firstName: updatedFirstName,
                     lastName: updatedLastName,
                     phone: updatedPhone,
-                    matricule: updatedMatricule
+                    matricule: updatedMatricule,
+                    poste: updatedPoste,
+                    perimetre: updatedPerimetre,
+                    signatureUrl: updatedSignatureUrl,
+                    stampUrl: updatedStampUrl
                 });
             } else {
                 await setDoc(doc(db, 'agents', editingAgent.uid), {
@@ -3233,7 +3470,11 @@ const SettingsPage = () => {
                     isNew: finalIsNew,
                     permissions: editingAgent.permissions || [],
                     phone: updatedPhone,
-                    matricule: updatedMatricule
+                    matricule: updatedMatricule,
+                    poste: updatedPoste,
+                    perimetre: updatedPerimetre,
+                    signatureUrl: updatedSignatureUrl,
+                    stampUrl: updatedStampUrl
                 });
             }
 
@@ -3682,21 +3923,40 @@ const SettingsPage = () => {
                                             onChange={e => setAgentForm(p => ({ ...p, matricule: e.target.value }))}
                                         />
                                     </div>
-                                    <div className="space-y-2 lg:col-span-1">
-                                        <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest pl-1">Périmètre de Responsabilité</label>
-                                        <div className="flex gap-4">
-                                            <button 
-                                                onClick={() => setAgentForm(p => ({ ...p, role: 'agent' }))}
-                                                className={cn("flex-1 py-4 rounded-xl border-2 font-black text-[10px] uppercase tracking-widest transition-all", agentForm.role === 'agent' ? "bg-primary text-white border-primary" : "bg-white text-gray-400 border-gray-100")}
-                                            >
-                                                Gestionnaire Dossiers
-                                            </button>
-                                            <button 
-                                                onClick={() => setAgentForm(p => ({ ...p, role: 'admin' }))}
-                                                className={cn("flex-1 py-4 rounded-xl border-2 font-black text-[10px] uppercase tracking-widest transition-all", agentForm.role === 'admin' ? "bg-primary text-white border-primary" : "bg-white text-gray-400 border-gray-100")}
-                                            >
-                                                Superviseur Admin
-                                            </button>
+                                    <div className="space-y-2">
+                                        <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest pl-1">Poste / Rôle <span className="text-red-500 font-bold">*</span></label>
+                                        <input 
+                                            placeholder="Ex: Secrétaire principal, Chef de Bureau" 
+                                            className="w-full px-6 py-4 bg-white border border-gray-200 rounded-2xl text-sm font-black outline-none focus:ring-4 focus:ring-primary/5 transition-all shadow-sm"
+                                            value={agentForm.poste}
+                                            onChange={e => setAgentForm(p => ({ ...p, poste: e.target.value }))}
+                                        />
+                                    </div>
+                                    <div className="space-y-2 lg:col-span-3">
+                                        <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest pl-1">Périmètre de Responsabilité (Hiérarchie de Contrôle)</label>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3 mt-1">
+                                            {[
+                                                { id: 'secretariat', label: 'Secrétariat', desc: 'Point d\'entrée unique et archivage du courrier.', role: 'agent' },
+                                                { id: 'gestionnaire', label: 'Gestionnaire Dossiers', desc: 'Rôle opérationnel de traitement de base.', role: 'agent' },
+                                                { id: 'admin_bureau', label: 'Administrateur de Bureau', desc: 'Chef de Bureau.', role: 'admin' },
+                                                { id: 'superviseur', label: 'Superviseur Admin', desc: 'Niveau de contrôle intermédiaire.', role: 'admin' },
+                                                { id: 'superviseur_senior', label: 'Superviseur Admin Senior', desc: 'Chef de Centre (Sommet de la hiérarchie).', role: 'admin' }
+                                            ].map(opt => (
+                                                <button 
+                                                    type="button"
+                                                    key={opt.id}
+                                                    onClick={() => setAgentForm(p => ({ ...p, perimetre: opt.id as any, role: opt.role as UserRole }))}
+                                                    className={cn(
+                                                        "p-4 rounded-2xl border flex flex-col text-left transition-all",
+                                                        agentForm.perimetre === opt.id 
+                                                            ? "bg-primary text-white border-primary shadow-md" 
+                                                            : "bg-white text-gray-500 border-gray-100 hover:border-gray-200"
+                                                    )}
+                                                >
+                                                    <span className="text-[9px] font-black uppercase tracking-wider">{opt.label}</span>
+                                                    <span className={cn("text-[8px] font-medium mt-1 leading-normal", agentForm.perimetre === opt.id ? "text-white/80" : "text-gray-400")}>{opt.desc}</span>
+                                                </button>
+                                            ))}
                                         </div>
                                     </div>
                                 </div>
@@ -3920,17 +4180,100 @@ const SettingsPage = () => {
                             </div>
                         </div>
                         <div className="p-8 bg-gray-50/50 rounded-3xl border border-gray-100 flex flex-col justify-center">
-                            <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-3">Statut & Habilitation</p>
-                            <div className="flex gap-2">
+                            <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-3">Statut & Habilitation DGI</p>
+                            <div className="flex flex-wrap gap-2">
                                 <span className={cn(
                                     "px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-[0.1em] border",
                                     user?.role === 'admin' ? "bg-primary text-white border-primary" : "bg-blue-600 text-white border-blue-600"
                                 )}>
                                     {user?.role === 'admin' ? 'ADMINISTRATEUR GLOBAL' : 'AGENT DGI CERTIFIÉ'}
                                 </span>
+                                {user?.perimetre && (
+                                    <span className="px-3 py-1 bg-teal-50 text-teal-700 rounded-full text-[9px] font-bold uppercase border border-teal-100">
+                                        {user.perimetre.replace('_', ' ').toUpperCase()}
+                                    </span>
+                                )}
                                 <span className="px-4 py-1.5 bg-green-500 text-white rounded-full text-[10px] font-black uppercase tracking-[0.1em] shadow-lg shadow-green-500/20">
                                     ACTIF
                                 </span>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Signature Électronique & Cachet Section */}
+                    <div className="mt-8 border-t border-gray-100 pt-8">
+                        <h3 className="text-sm font-black text-[#2C3E50] uppercase tracking-wider mb-2">Signature Électronique & Cachet du Bureau (Détorage Luminescent)</h3>
+                        <p className="text-xs text-gray-400 mb-6 leading-relaxed">
+                            Téléchargez un scan ou une photo de votre signature ou cachet officiel. Notre processeur de luminance local va isoler l'encre (seuil de blanc) pour rendre le fond 100% transparent.
+                        </p>
+                        
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                            {/* Signature Component */}
+                            <div className="p-6 bg-gray-50 rounded-3xl border border-gray-100 flex flex-col items-center justify-center text-center">
+                                <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-4">Votre Signature Numérique</p>
+                                <div className="w-full h-32 bg-white border-2 border-dashed border-gray-200 rounded-2xl flex items-center justify-center relative overflow-hidden select-none">
+                                    {user?.signatureUrl ? (
+                                        <div className="absolute inset-0 bg-[radial-gradient(#e5e7eb_1px,transparent_1px)] [background-size:16px_16px] flex items-center justify-center p-3">
+                                            <img src={user.signatureUrl} alt="Signature détourée" className="max-h-full max-w-full object-contain" />
+                                        </div>
+                                    ) : (
+                                        <div className="text-gray-400 flex flex-col items-center p-4">
+                                            <svg className="w-8 h-8 mb-2 stroke-current opacity-40" viewBox="0 0 24 24" fill="none" strokeWidth="2"><path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                                            <span className="text-[9px] font-black uppercase tracking-wider text-gray-400">Aucune signature chargée</span>
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="mt-4 flex gap-2">
+                                    <label className="px-4 py-2 bg-[#2C3E50] text-white text-[10px] font-black uppercase tracking-widest rounded-xl cursor-pointer hover:bg-opacity-95 transition-all">
+                                        Charger JPEG/PNG
+                                        <input type="file" accept="image/*" className="hidden" onChange={(e) => {
+                                            const file = e.target.files?.[0];
+                                            if (file) handleImageDeterage(file, 'signature');
+                                        }} />
+                                    </label>
+                                    {user?.signatureUrl && (
+                                        <button 
+                                            onClick={() => handleSaveUserSignatureOrStamp('signature', '')}
+                                            className="px-4 py-2 bg-white text-red-500 font-bold text-[10px] uppercase tracking-widest rounded-xl border border-gray-200 hover:bg-red-50 transition-all"
+                                        >
+                                            Effacer
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Cachet Component */}
+                            <div className="p-6 bg-gray-50 rounded-3xl border border-gray-100 flex flex-col items-center justify-center text-center">
+                                <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-4">Cachet Officiel du Bureau</p>
+                                <div className="w-full h-32 bg-white border-2 border-dashed border-gray-200 rounded-2xl flex items-center justify-center relative overflow-hidden select-none">
+                                    {user?.stampUrl ? (
+                                        <div className="absolute inset-0 bg-[radial-gradient(#e5e7eb_1px,transparent_1px)] [background-size:16px_16px] flex items-center justify-center p-3">
+                                            <img src={user.stampUrl} alt="Cachet de service détouré" className="max-h-full max-w-full object-contain" />
+                                        </div>
+                                    ) : (
+                                        <div className="text-gray-400 flex flex-col items-center p-4">
+                                            <svg className="w-8 h-8 mb-2 stroke-current opacity-40" viewBox="0 0 24 24" fill="none" strokeWidth="2"><circle cx="12" cy="12" r="10"/><path d="m14.5 11.5-2.5 2.5-2.5-2.5"/></svg>
+                                            <span className="text-[9px] font-black uppercase tracking-wider text-gray-400">Aucun cachet de service</span>
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="mt-4 flex gap-2">
+                                    <label className="px-4 py-2 bg-[#2C3E50] text-white text-[10px] font-black uppercase tracking-widest rounded-xl cursor-pointer hover:bg-opacity-95 transition-all">
+                                        Charger JPEG/PNG
+                                        <input type="file" accept="image/*" className="hidden" onChange={(e) => {
+                                            const file = e.target.files?.[0];
+                                            if (file) handleImageDeterage(file, 'stamp');
+                                        }} />
+                                    </label>
+                                    {user?.stampUrl && (
+                                        <button 
+                                            onClick={() => handleSaveUserSignatureOrStamp('stamp', '')}
+                                            className="px-4 py-2 bg-white text-red-500 font-bold text-[10px] uppercase tracking-widest rounded-xl border border-gray-200 hover:bg-red-50 transition-all"
+                                        >
+                                            Effacer
+                                        </button>
+                                    )}
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -4008,35 +4351,43 @@ const SettingsPage = () => {
                                             value={editingAgent.email}
                                         />
                                     </div>
+                                    <div className="space-y-1">
+                                        <label className="text-[9px] font-bold text-gray-400 uppercase tracking-wide">Poste / Rôle DGI</label>
+                                        <input 
+                                            type="text"
+                                            className="w-full px-4 py-3 bg-white border border-gray-200 rounded-xl text-xs font-black outline-none focus:ring-4 focus:ring-primary/5 transition-all shadow-sm"
+                                            value={editingAgent.poste || ''}
+                                            onChange={e => setEditingAgent(p => p ? { ...p, poste: e.target.value } : null)}
+                                            placeholder="Ex: Administrateur Principal, Secrétaire"
+                                        />
+                                    </div>
                                 </div>
                                 {/* Périmètre de responsabilité */}
                                 <div className="space-y-3">
-                                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Périmètre de Responsabilité</label>
-                                    <div className="flex gap-4">
-                                        <button 
-                                            type="button"
-                                            onClick={() => setEditingAgent(p => p ? { ...p, role: 'agent' } : null)}
-                                            className={cn(
-                                                "flex-1 py-4 rounded-xl border-2 font-black text-[10px] uppercase tracking-widest transition-all", 
-                                                editingAgent.role === 'agent' 
-                                                    ? "bg-primary text-white border-primary shadow-lg shadow-primary/20" 
-                                                    : "bg-white text-gray-400 border-gray-100 hover:border-gray-200"
-                                            )}
-                                        >
-                                            Gestionnaire Dossiers
-                                        </button>
-                                        <button 
-                                            type="button"
-                                            onClick={() => setEditingAgent(p => p ? { ...p, role: 'admin' } : null)}
-                                            className={cn(
-                                                "flex-1 py-4 rounded-xl border-2 font-black text-[10px] uppercase tracking-widest transition-all", 
-                                                editingAgent.role === 'admin' 
-                                                    ? "bg-primary text-white border-primary shadow-lg shadow-primary/20" 
-                                                    : "bg-white text-gray-400 border-gray-100 hover:border-gray-200"
-                                            )}
-                                        >
-                                            Superviseur Admin
-                                        </button>
+                                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Périmètre de Responsabilité (Hiérarchie de Contrôle)</label>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                                        {[
+                                            { id: 'secretariat', label: 'Secrétariat', desc: 'Point d\'entrée unique et archivage du courrier.', role: 'agent' },
+                                            { id: 'gestionnaire', label: 'Gestionnaire Dossiers', desc: 'Rôle opérationnel de traitement de base.', role: 'agent' },
+                                            { id: 'admin_bureau', label: 'Administrateur de Bureau', desc: 'Chef de Bureau.', role: 'admin' },
+                                            { id: 'superviseur', label: 'Superviseur Admin', desc: 'Niveau de contrôle intermédiaire.', role: 'admin' },
+                                            { id: 'superviseur_senior', label: 'Superviseur Admin Senior', desc: 'Chef de Centre (Sommet de la hiérarchie).', role: 'admin' }
+                                        ].map(opt => (
+                                            <button 
+                                                type="button"
+                                                key={opt.id}
+                                                onClick={() => setEditingAgent(p => p ? { ...p, perimetre: opt.id as any, role: opt.role as UserRole } : null)}
+                                                className={cn(
+                                                    "p-3 rounded-xl border flex flex-col text-left transition-all",
+                                                    editingAgent.perimetre === opt.id 
+                                                        ? "bg-primary text-white border-primary shadow-md" 
+                                                        : "bg-white text-gray-500 border-gray-100 hover:border-gray-200"
+                                                )}
+                                            >
+                                                <span className="text-[9px] font-black uppercase tracking-wider">{opt.label}</span>
+                                                <span className={cn("text-[8px] font-medium mt-0.5 leading-normal", editingAgent.perimetre === opt.id ? "text-white/80" : "text-gray-400")}>{opt.desc}</span>
+                                            </button>
+                                        ))}
                                     </div>
                                 </div>
 
@@ -5531,6 +5882,12 @@ const InternalChatPage = () => {
     const [searchAgent, setSearchAgent] = useState('');
     const [activeTab, setActiveTab] = useState<'public' | 'private'>('public');
     const [uploadProgress, setUploadProgress] = useState<number[]>([]);
+    const [showInternalScanner, setShowInternalScanner] = useState(false);
+
+    const addScannedFileToInternalChat = (file: File) => {
+        setTempAttachments(prev => [...prev, file]);
+        setShowInternalScanner(false);
+    };
 
     // GED Transfer Gateway State
     const [gedTransferFile, setGedTransferFile] = useState<any | null>(null);
@@ -5765,7 +6122,12 @@ const InternalChatPage = () => {
                         return copy;
                     });
                 });
-                uploaded.push({ url, name: file.name, type: file.type });
+                uploaded.push({ 
+                    url, 
+                    name: file.name, 
+                    type: file.type,
+                    extractedText: (file as any).extractedText || ''
+                });
             }
 
             const currentThreadId = activeTab === 'private' && selectedAgent 
@@ -6224,10 +6586,18 @@ const InternalChatPage = () => {
                                 </div>
                             )}
                             <form onSubmit={handleSend} className="flex items-end gap-6 bg-gray-50/50 p-2 rounded-[2.5rem] border border-gray-200 shadow-inner focus-within:border-primary/20 transition-all">
-                                <label className="p-4 hover:bg-white rounded-full text-gray-400 hover:text-primary transition-all cursor-pointer">
+                                <label className="p-4 hover:bg-white rounded-full text-gray-400 hover:text-primary transition-all cursor-pointer shrink-0">
                                     <Paperclip size={24} />
                                     <input type="file" multiple className="hidden" onChange={handleInternalFileChange} />
                                 </label>
+                                <button
+                                    type="button"
+                                    onClick={() => setShowInternalScanner(true)}
+                                    className="p-4 hover:bg-white rounded-full text-gray-400 hover:text-primary transition-all cursor-pointer shrink-0 flex items-center justify-center bg-transparent border-0"
+                                    title="Numériser un document"
+                                >
+                                    <Camera size={24} />
+                                </button>
                                 <div className="flex-1 flex flex-col">
                                     {uploading && uploadProgress.some(p => p > 0 && p < 100) && (
                                         <div className="flex gap-2 mb-2 px-2 overflow-x-auto scrollbar-hide">
@@ -6422,6 +6792,14 @@ const InternalChatPage = () => {
                         </Dialog.Root>
                     </>
                   ) : null
+                )}
+
+                {showInternalScanner && (
+                    <DocumentScanner 
+                        onClose={() => setShowInternalScanner(false)} 
+                        onScanComplete={addScannedFileToInternalChat} 
+                        title="Numériseur Chat Interne"
+                    />
                 )}
             </div>
         </div>
@@ -6820,6 +7198,7 @@ const MainContent = () => {
                     <>
                         <Route path="/internal" element={<InternalChatPage />} />
                         <Route path="/directory" element={<DirectoryPage />} />
+                        <Route path="/dossiers-internes" element={<DossiersInternesPage />} />
                     </>
                 )}
                 <Route path="/settings" element={<SettingsPage />} />

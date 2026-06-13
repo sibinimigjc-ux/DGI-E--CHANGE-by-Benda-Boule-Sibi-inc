@@ -13,9 +13,10 @@ interface DocumentScannerProps {
   onClose: () => void;
   onScanComplete: (file: File) => void;
   title?: string;
+  forceSingleImageOnly?: boolean;
 }
 
-export default function DocumentScanner({ onClose, onScanComplete, title = 'Num√©riseur de Documents' }: DocumentScannerProps) {
+export default function DocumentScanner({ onClose, onScanComplete, title = 'Num√©riseur de Documents', forceSingleImageOnly = false }: DocumentScannerProps) {
   // Navigation & workflow screens:
   // - 'camera': upload, drag or drop files
   // - 'crop': crop a single raw image individually with 90¬∞ rotate and validate buttons
@@ -40,7 +41,7 @@ export default function DocumentScanner({ onClose, onScanComplete, title = 'Num√
 
   // Form Fields
   const [documentName, setDocumentName] = useState('');
-  const [exportFormat, setExportFormat] = useState<'jpeg' | 'pdf'>('pdf');
+  const [exportFormat, setExportFormat] = useState<'jpeg' | 'pdf'>(forceSingleImageOnly ? 'jpeg' : 'pdf');
 
   // Interactive Crop boundaries (percentages 0-100)
   const [crop, setCrop] = useState({ x1: 15, y1: 15, x2: 85, y2: 85 });
@@ -71,11 +72,12 @@ export default function DocumentScanner({ onClose, onScanComplete, title = 'Num√
 
   // Safe file loader pipeline with fallback support
   const processCapturedFiles = (files: File[]) => {
+    const filesToLoad = forceSingleImageOnly ? files.slice(0, 1) : files;
     setLoading(true);
     const loadedDataUrls: { dataUrl: string; width: number; height: number }[] = [];
 
     const readAndLoad = (index: number) => {
-      if (index >= files.length) {
+      if (index >= filesToLoad.length) {
         if (loadedDataUrls.length > 0) {
           // Keep first image for immediate cropping
           const first = loadedDataUrls[0];
@@ -85,7 +87,7 @@ export default function DocumentScanner({ onClose, onScanComplete, title = 'Num√
           setDisplayedSize(null);
 
           // Save subsequent ones for cropping queue
-          setCropQueue(loadedDataUrls.slice(1).map(x => x.dataUrl));
+          setCropQueue(forceSingleImageOnly ? [] : loadedDataUrls.slice(1).map(x => x.dataUrl));
           setScreen('crop');
         }
         setLoading(false);
@@ -746,33 +748,44 @@ export default function DocumentScanner({ onClose, onScanComplete, title = 'Num√
                     <label className="block text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2">
                       Format d'exportation
                     </label>
-                    <div className="grid grid-cols-2 gap-3">
-                      <button 
-                        type="button"
-                        onClick={() => setExportFormat('pdf')}
-                        className={`py-3 rounded-xl border text-center transition-all cursor-pointer flex flex-col items-center justify-center gap-1 ${
-                          exportFormat === 'pdf' 
-                            ? "bg-cyan-950/40 border-cyan-500 text-cyan-400" 
-                            : "bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-white hover:border-zinc-700"
-                        }`}
-                      >
-                        <FileText size={16} />
-                        <span className="text-[9px] font-black uppercase tracking-wider">Format PDF</span>
-                      </button>
+                    {forceSingleImageOnly ? (
+                      <div className="p-3 bg-cyan-950/25 border border-cyan-800/40 rounded-xl">
+                        <span className="block text-[9.5px]/[normal] font-black uppercase text-cyan-400 tracking-wider mb-1 flex items-center gap-1.5">
+                          üñºÔ∏è Format Image Obligatoire (PNG/JPEG)
+                        </span>
+                        <p className="text-[9px] text-zinc-500 font-bold leading-normal uppercase">
+                          La signature/cachet num√©ris√© sera extrait au format image JPEG transparent.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-3">
+                        <button 
+                          type="button"
+                          onClick={() => setExportFormat('pdf')}
+                          className={`py-3 rounded-xl border text-center transition-all cursor-pointer flex flex-col items-center justify-center gap-1 ${
+                            exportFormat === 'pdf' 
+                              ? "bg-cyan-950/40 border-cyan-500 text-cyan-400" 
+                              : "bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-white hover:border-zinc-700"
+                          }`}
+                        >
+                          <FileText size={16} />
+                          <span className="text-[9px] font-black uppercase tracking-wider">Format PDF</span>
+                        </button>
 
-                      <button 
-                        type="button"
-                        onClick={() => setExportFormat('jpeg')}
-                        className={`py-3 rounded-xl border text-center transition-all cursor-pointer flex flex-col items-center justify-center gap-1 ${
-                          exportFormat === 'jpeg' 
-                            ? "bg-cyan-950/40 border-cyan-500 text-cyan-400" 
-                            : "bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-white hover:border-zinc-700"
-                        }`}
-                      >
-                        <FileImage size={16} />
-                        <span className="text-[9px] font-black uppercase tracking-wider">Format JPEG</span>
-                      </button>
-                    </div>
+                        <button 
+                          type="button"
+                          onClick={() => setExportFormat('jpeg')}
+                          className={`py-3 rounded-xl border text-center transition-all cursor-pointer flex flex-col items-center justify-center gap-1 ${
+                            exportFormat === 'jpeg' 
+                              ? "bg-cyan-950/40 border-cyan-500 text-cyan-400" 
+                              : "bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-white hover:border-zinc-700"
+                          }`}
+                        >
+                          <FileImage size={16} />
+                          <span className="text-[9px] font-black uppercase tracking-wider">Format JPEG</span>
+                        </button>
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <div className="p-3 bg-cyan-950/20 border border-cyan-800/30 rounded-xl">
@@ -822,14 +835,16 @@ export default function DocumentScanner({ onClose, onScanComplete, title = 'Num√
                     ))}
 
                     {/* Quick snap plus button */}
-                    <button 
-                      onClick={() => setScreen('camera')}
-                      className="w-14 h-18 bg-zinc-900 border border-dashed border-zinc-800 rounded-lg flex flex-col items-center justify-center text-zinc-400 hover:text-cyan-400 hover:border-cyan-900 transition-all cursor-pointer"
-                      title="Scanner une autre page"
-                    >
-                      <Plus size={13} />
-                      <span className="text-[7px] font-bold uppercase tracking-wider mt-1">Ajouter</span>
-                    </button>
+                    {!forceSingleImageOnly && (
+                      <button 
+                        onClick={() => setScreen('camera')}
+                        className="w-14 h-18 bg-zinc-900 border border-dashed border-zinc-800 rounded-lg flex flex-col items-center justify-center text-zinc-400 hover:text-cyan-400 hover:border-cyan-900 transition-all cursor-pointer"
+                        title="Scanner une autre page"
+                      >
+                        <Plus size={13} />
+                        <span className="text-[7px] font-bold uppercase tracking-wider mt-1">Ajouter</span>
+                      </button>
+                    )}
                   </div>
                 </div>
 

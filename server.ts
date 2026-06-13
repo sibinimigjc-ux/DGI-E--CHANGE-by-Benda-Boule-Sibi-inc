@@ -32,6 +32,33 @@ async function startServer() {
     res.json({ status: "ok" });
   });
 
+  // CORS bypass proxy for PDFs and documents
+  app.get("/api/proxy-pdf", async (req, res) => {
+    try {
+      const targetUrl = req.query.url as string;
+      if (!targetUrl) {
+        return res.status(400).json({ error: "Missing url parameter" });
+      }
+
+      console.log(`[Proxy PDF] Fetching cross-origin URL: ${targetUrl}`);
+      const response = await fetch(targetUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch from remote URL. Status: ${response.status}`);
+      }
+
+      const contentType = response.headers.get("content-type") || "application/pdf";
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Access-Control-Allow-Origin", "*");
+
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      return res.send(buffer);
+    } catch (err: any) {
+      console.error("[Proxy PDF] error:", err);
+      return res.status(500).json({ error: err.message || "Failed to proxy document" });
+    }
+  });
+
   // Gemini-powered Document Corner Detection using background server-side API call (Zéro Déformation)
   app.post("/api/detect-corners", async (req, res) => {
     try {

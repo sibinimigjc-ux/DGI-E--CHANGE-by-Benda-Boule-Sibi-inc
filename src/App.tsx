@@ -12,6 +12,7 @@ import {
   signInWithPopup, 
   signOut, 
   signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
   reauthenticateWithCredential,
   EmailAuthProvider,
   GoogleAuthProvider,
@@ -42,6 +43,7 @@ import {
 
 import { auth, db, googleProvider, storage } from './lib/firebase';
 import { motion } from 'motion/react';
+import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import { 
   ref, 
   uploadBytes, 
@@ -377,6 +379,7 @@ const AuthContext = createContext<{
   setInternalAuthPending: (val: boolean) => void;
   setIsFirstSetup: (val: boolean) => void;
   loginWithGoogle: () => Promise<void>;
+  loginAsTaxpayer: (email: string, regInfo?: { nif: string, name: string }) => Promise<void>;
   reauthenticate: (password: string) => Promise<boolean>;
   logout: () => Promise<void>;
 } | null>(null);
@@ -729,9 +732,11 @@ const AuthProvider = ({ children }: { children: React.ReactNode }) => {
               const emailSnap = await getDocs(query(usersRef, where('email', '==', fbUser.email)));
               
               let existingData: any = null;
+              let oldUserId: string | null = null;
               if (!emailSnap.empty) {
                 const matchedDoc = emailSnap.docs[0];
                 existingData = matchedDoc.data();
+                oldUserId = matchedDoc.id;
                 await deleteDoc(matchedDoc.ref);
               }
 
@@ -766,13 +771,16 @@ const AuthProvider = ({ children }: { children: React.ReactNode }) => {
                 }
               }
 
+              const resolvedTaxNumber = taxNumber || existingData?.taxNumber || null;
+              const resolvedCompanyName = companyName || existingData?.companyName || existingData?.displayName || null;
+
               const newUser: AppUser = {
                 uid: fbUser.uid,
                 email: fbUser.email || '',
                 role: existingData?.role || (hasProfessionalRole ? initialRole : 'contributor'),
-                displayName: companyName || fbUser.displayName || existingData?.displayName || fbUser.displayName || 'Utilisateur',
+                displayName: resolvedCompanyName || fbUser.displayName || 'Utilisateur',
                 photoURL: fbUser.photoURL || '',
-                isSetup: hasProfessionalRole ? true : !!taxNumber,
+                isSetup: hasProfessionalRole ? true : !!resolvedTaxNumber,
                 isActive: true,
                 isNew: hasProfessionalRole ? (existingData ? (existingData.isNew !== false) : true) : false, // Taxpayers never have the "isNew" password setup flag
                 lastLogin: serverTimestamp(),
@@ -780,20 +788,90 @@ const AuthProvider = ({ children }: { children: React.ReactNode }) => {
                 phone: existingData?.phone || null,
                 address: existingData?.address || null,
                 permissions: existingData?.permissions || [],
-                taxNumber: taxNumber || null,
-                companyName: companyName || null
+                taxNumber: resolvedTaxNumber,
+                companyName: resolvedCompanyName,
+                emailVerified: true,
+                signatureUrl: existingData?.signatureUrl || null,
+                stampUrl: existingData?.stampUrl || null
               };
               await setDoc(docRef, newUser);
 
-              // If registering as a taxpayer, also populate the contribuables collection
-              if (!hasProfessionalRole && taxNumber) {
+              // If registering as a taxpayer, or adopting preconfigured, also populate the contribuables collection
+              if (!hasProfessionalRole && (resolvedTaxNumber || resolvedCompanyName)) {
+                // Save under user UID
                 await setDoc(doc(db, 'contribuables', fbUser.uid), {
                   uid: fbUser.uid,
                   email: fbUser.email,
-                  taxNumber: taxNumber,
-                  companyName: companyName,
-                  role: 'contributor'
+                  taxNumber: resolvedTaxNumber || '',
+                  companyName: resolvedCompanyName || '',
+                  role: 'contributor',
+                  emailVerified: true,
+                  signatureUrl: newUser.signatureUrl || '',
+                  stampUrl: newUser.stampUrl || ''
                 });
+
+                // Save under lowercase trimmed email as unique ID
+                const emailClean = fbUser.email.toLowerCase().trim();
+                await setDoc(doc(db, 'contribuables', emailClean), {
+                  uid: fbUser.uid,
+                  email: emailClean,
+                  taxNumber: resolvedTaxNumber || '',
+                  companyName: resolvedCompanyName || '',
+                  role: 'contributor',
+                  emailVerified: true,
+                  signatureUrl: newUser.signatureUrl || '',
+                  stampUrl: newUser.stampUrl || ''
+                }, { merge: true });
+              }
+
+              // Adopt and migrate conversations and ged_items if they were created with old dummy user ID
+              if (oldUserId && oldUserId !== fbUser.uid) {
+                // 1. Conversations
+                try {
+                  const convRef = collection(db, 'conversations');
+                  const convSnap = await getDocs(query(convRef, where('participants', 'array-contains', oldUserId)));
+                  for (const cDoc of convSnap.docs) {
+                    const cData = cDoc.data();
+                    const newParticipants = (cData.participants as string[]).map(p => p === oldUserId ? fbUser.uid : p);
+                    const updateObj: any = {
+                      participants: newParticipants
+                    };
+                    if (cData.contributorId === oldUserId) {
+                      updateObj.contributorId = fbUser.uid;
+                    }
+                    await updateDoc(cDoc.ref, updateObj);
+                  }
+                } catch (convMigrateErr) {
+                  console.error("Failed to migrate conversations during adoption:", convMigrateErr);
+                }
+
+                // 2. GED Items
+                try {
+                  const gedRef = collection(db, 'ged_items');
+                  const gedSnap = await getDocs(query(gedRef, where('contributorId', '==', oldUserId)));
+                  for (const gDoc of gedSnap.docs) {
+                    await updateDoc(gDoc.ref, {
+                      contributorId: fbUser.uid
+                    });
+                  }
+                  
+                  const gedOwnerSnap = await getDocs(query(gedRef, where('ownerId', '==', oldUserId)));
+                  for (const gDoc of gedOwnerSnap.docs) {
+                    await updateDoc(gDoc.ref, {
+                      ownerId: fbUser.uid
+                    });
+                  }
+                } catch (gedMigrateErr) {
+                  console.error("Failed to migrate ged_items during adoption:", gedMigrateErr);
+                }
+
+                // 3. Delete old taxpayer document in contribuables if it exists
+                try {
+                  const oldContribRef = doc(db, 'contribuables', oldUserId);
+                  await deleteDoc(oldContribRef);
+                } catch (delOldContribErr) {
+                  // Ignore
+                }
               }
             }
           });
@@ -845,13 +923,61 @@ const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     }
   };
 
+  const loginAsTaxpayer = async (email: string, regInfo?: { nif: string, name: string }) => {
+    setAuthActionLoading(true);
+    try {
+      const emailClean = email.toLowerCase().trim();
+      const dummyPassword = "DgiTaxpayerP@ssword_" + emailClean.replace(/[^a-zA-Z0-9]/g, '');
+      
+      if (regInfo) {
+        localStorage.setItem('pending_taxpayer_reg', JSON.stringify({
+          taxNumber: regInfo.nif,
+          companyName: regInfo.name
+        }));
+      }
+
+      try {
+        await signInWithEmailAndPassword(auth, emailClean, dummyPassword);
+      } catch (signInErr: any) {
+        if (
+          signInErr.code === 'auth/user-not-found' || 
+          signInErr.code === 'auth/invalid-credential' || 
+          signInErr.code === 'auth/wrong-password' ||
+          signInErr.code === 'auth/user-disabled'
+        ) {
+          try {
+            await createUserWithEmailAndPassword(auth, emailClean, dummyPassword);
+          } catch (createErr: any) {
+            if (createErr.code === 'auth/email-already-in-use') {
+              throw new Error("Cette adresse e-mail est déjà associée à un compte existant (par exemple un compte Agent ou Admin via Google). Veuillez utiliser une adresse e-mail différente pour l'espace contribuable ou vous connecter via le bouton Google.");
+            }
+            throw createErr;
+          }
+        } else {
+          throw signInErr;
+        }
+      }
+    } catch (e) {
+      console.error(e);
+      throw e;
+    } finally {
+      setAuthActionLoading(false);
+    }
+  };
+
   const reauthenticate = async (password: string): Promise<boolean> => {
     // Basic password validation for internal auth
     return isMasterCodeValid(password); 
   };
 
   const logout = async () => {
-    await signOut(auth);
+    localStorage.removeItem('pending_taxpayer_reg');
+    try {
+      await signOut(auth);
+    } catch (e) {
+      console.error("Signout error:", e);
+    }
+    setUser(null);
     setAdminMode(false);
     setAdminAuthenticated(false);
     setUserViewMode(false);
@@ -872,7 +998,7 @@ const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       user, loading, authActionLoading, isAdminMode, isAdminAuthenticated, userViewMode,
       activeRole, availableRoles, internalAuthPending, isFirstSetup,
       setAdminMode, setAdminAuthenticated, setUserViewMode, setActiveRole, setInternalAuthPending, setIsFirstSetup,
-      loginWithGoogle, reauthenticate, logout 
+      loginWithGoogle, loginAsTaxpayer, reauthenticate, logout 
     }}>
       {children}
     </AuthContext.Provider>
@@ -1320,6 +1446,7 @@ const AppShell = ({ children }: { children: React.ReactNode }) => {
                 <SidebarLink to="/messaging" icon={Mail} label="Mes Conversations" active={location.pathname === '/messaging'} />
                 <SidebarLink to="/ged" icon={HardDrive} label="Gestion des dossiers" active={location.pathname === '/ged'} />
                 <SidebarLink to="/account" icon={UserCircle} label="Mon Compte" active={location.pathname === '/account'} />
+                <SidebarLink to="/settings" icon={Settings} label="Configuration" active={location.pathname === '/settings'} />
               </>
             ) : (
               <>
@@ -1571,7 +1698,7 @@ const DashboardPage = () => {
                         ) : (
                             <div className="space-y-6 md:space-y-8">
                                 {recent.map((item) => (
-                                    <div key={item.id} className="flex items-center gap-4 md:gap-6 group cursor-pointer" onClick={() => navigate('/messaging')}>
+                                    <div key={item.id} className="flex items-center gap-4 md:gap-6 group cursor-pointer" onClick={() => navigate('/messaging', { state: { conversationId: item.id } })}>
                                         <div className="w-10 h-10 md:w-14 md:h-14 rounded-xl md:rounded-[1.25rem] bg-gray-50 flex items-center justify-center text-primary font-black text-sm md:text-lg border border-gray-100 group-hover:bg-primary group-hover:text-white transition-all shadow-sm shrink-0 uppercase">
                                             {(item.companyName || item.subject)[0]}
                                         </div>
@@ -1630,6 +1757,12 @@ const MessagingPage = () => {
     const [convToDelete, setConvToDelete] = useState<Conversation | null>(null);
     const [status, setStatus] = useState('');
     const [fileToView, setFileToView] = useState<Attachment | null>(null);
+
+    // Keep active selected conversation synced in real-time
+    const selectedConvRef = useRef<Conversation | null>(null);
+    useEffect(() => {
+        selectedConvRef.current = selectedConv;
+    }, [selectedConv]);
 
     // GED Transfer Gateway State
     const [gedTransferFile, setGedTransferFile] = useState<Attachment | null>(null);
@@ -1926,6 +2059,14 @@ const MessagingPage = () => {
                 }
 
                 setConversations(list);
+
+                // Keep the active selected conversation up-to-date in real-time
+                if (selectedConvRef.current) {
+                    const freshConv = list.find(c => c.id === selectedConvRef.current?.id);
+                    if (freshConv) {
+                        setSelectedConv(freshConv);
+                    }
+                }
             },
             (err) => handleFirestoreError(err, OperationType.LIST, 'conversations')
         );
@@ -1945,6 +2086,28 @@ const MessagingPage = () => {
         );
         return () => unsub();
     }, [selectedConv?.id]);
+
+    // Real-time read receipt updates for taxonomic taxpayer conversation
+    useEffect(() => {
+        if (!user || !selectedConv || messages.length === 0) return;
+
+        // Messages where current user is the recipient (senderId !== user.uid)
+        const unreadMsg = messages.filter(m => m.senderId !== user.uid && (!m.isRead || !m.isReceived));
+        if (unreadMsg.length > 0) {
+            unreadMsg.forEach(async (m) => {
+                try {
+                    const mDocRef = doc(db, 'conversations', selectedConv.id, 'messages', m.id);
+                    await updateDoc(mDocRef, {
+                        isReceived: true,
+                        isRead: true,
+                        readAt: serverTimestamp()
+                    });
+                } catch (err) {
+                    console.warn("Error marking taxpayer message as read:", err);
+                }
+            });
+        }
+    }, [messages, selectedConv, user]);
 
     useEffect(() => {
         const isSuper = (user as any)?.isSuperContribuable;
@@ -2045,6 +2208,8 @@ const MessagingPage = () => {
                 }
             }
 
+            const isPendingAck = (user.role !== 'contributor' && finalAttachments.some(att => att.type?.startsWith('image/') || att.type === 'application/pdf'));
+
             if (!conversationId) {
                 let finalAssignedAgentId = 'global';
                 let finalAssignedAgentEmail = 'global';
@@ -2075,7 +2240,8 @@ const MessagingPage = () => {
                     status: 'open',
                     companyName: targetTaxpayer?.companyName || targetTaxpayer?.displayName || 'Inconnu',
                     contributorName: targetTaxpayer?.displayName || '',
-                    taxNumber: targetTaxpayer?.taxNumber || ''
+                    taxNumber: targetTaxpayer?.taxNumber || '',
+                    pendingAcknowledgement: isPendingAck
                 });
                 conversationId = convRef.id;
             } else {
@@ -2084,6 +2250,7 @@ const MessagingPage = () => {
                     lastMessagePreview: finalBody.substring(0, 100),
                     isReadByContributor: user.role === 'contributor',
                     isReadByDGI: user.role !== 'contributor',
+                    pendingAcknowledgement: isPendingAck ? true : (selectedConv?.pendingAcknowledgement || false)
                 });
             }
 
@@ -2097,7 +2264,10 @@ const MessagingPage = () => {
                 attachments: finalAttachments,
                 hasAttachments: finalAttachments.length > 0,
                 createdAt: serverTimestamp(),
-                conversationId: conversationId
+                conversationId: conversationId,
+                requiresAcknowledgement: isPendingAck || false,
+                isReceived: false,
+                isRead: false
             });
 
             if (finalAttachments.length > 0) {
@@ -2149,6 +2319,573 @@ const MessagingPage = () => {
         });
         setIsComposeOpen(true);
         setSelectedConv(null);
+    };
+
+    const handleAcceptAcknowledgement = async (conv: Conversation) => {
+        if (!user || user.role !== 'contributor') return;
+        
+        // Barrier configuration validation
+        const hasSignature = !!user.signatureUrl;
+        const hasStamp = !!user.stampUrl;
+        if (!hasSignature || !hasStamp) {
+            alert("Veuillez configurer votre signature et votre sceau officiel avant d'accuser réception.");
+            setSelectedConv(null);
+            navigate('/settings');
+            return;
+        }
+        
+        setUploading(true);
+        setStatus("Certification de l'Accusé de Réception...");
+        
+        try {
+            // Find messages for this conversation
+            const msgSnap = await getDocs(query(
+                collection(db, 'conversations', conv.id, 'messages'),
+                orderBy('createdAt', 'asc')
+            ));
+            const msgList = msgSnap.docs.map(d => ({ id: d.id, ...d.data() } as any));
+            
+            const lastAgentMsg = [...msgList]
+                .reverse()
+                .find(m => m.senderId !== user.uid && m.attachments && m.attachments.length > 0);
+            
+            const documentAttachment = lastAgentMsg?.attachments?.find((a: any) => 
+                a.type?.startsWith('image/') || a.type === 'application/pdf'
+            );
+            
+            const docName = documentAttachment?.name || "Document administratif";
+            const docDate = lastAgentMsg?.createdAt 
+                ? lastAgentMsg.createdAt.toDate().toLocaleString('fr-FR') 
+                : new Date().toLocaleString('fr-FR');
+
+            const isPdfFile = documentAttachment && (
+                documentAttachment.type === 'application/pdf' || 
+                documentAttachment.name?.toLowerCase().endsWith('.pdf') || 
+                documentAttachment.url?.toLowerCase().includes('.pdf')
+            );
+
+            // Helpers to get ArrayBuffer securely and normalize files/images to standard formats
+            const getBytesFromUrl = async (url: string): Promise<ArrayBuffer> => {
+                if (url.startsWith('data:')) {
+                    const base64Str = url.split(',')[1];
+                    const binaryStr = window.atob(base64Str);
+                    const len = binaryStr.length;
+                    const bytes = new Uint8Array(len);
+                    for (let i = 0; i < len; i++) {
+                        bytes[i] = binaryStr.charCodeAt(i);
+                    }
+                    return bytes.buffer;
+                }
+                let target = url;
+                if (target.startsWith('http://') || target.startsWith('https://')) {
+                    target = `/api/proxy-pdf?url=${encodeURIComponent(target)}`;
+                }
+                const res = await fetch(target);
+                return await res.arrayBuffer();
+            };
+
+            const convertImageToPngBytes = async (imgUrl: string): Promise<ArrayBuffer> => {
+                return new Promise((resolve, reject) => {
+                    const img = new window.Image();
+                    img.crossOrigin = 'anonymous';
+                    img.onload = () => {
+                        const canvas = document.createElement('canvas');
+                        canvas.width = img.width;
+                        canvas.height = img.height;
+                        const ctx = canvas.getContext('2d');
+                        if (ctx) {
+                            ctx.drawImage(img, 0, 0);
+                            canvas.toBlob((blob) => {
+                                if (blob) {
+                                    blob.arrayBuffer().then(resolve).catch(reject);
+                                } else {
+                                    reject(new Error("Blob conversion failed"));
+                                }
+                            }, 'image/png');
+                        } else {
+                            reject(new Error("Canvas context failed"));
+                        }
+                    };
+                    img.onerror = () => {
+                        if (imgUrl.startsWith('http://') || imgUrl.startsWith('https://')) {
+                            const proxiedUrl = `/api/proxy-pdf?url=${encodeURIComponent(imgUrl)}`;
+                            const imgProxy = new window.Image();
+                            imgProxy.crossOrigin = 'anonymous';
+                            imgProxy.onload = () => {
+                                const canvas = document.createElement('canvas');
+                                canvas.width = imgProxy.width;
+                                canvas.height = imgProxy.height;
+                                const ctx = canvas.getContext('2d');
+                                if (ctx) {
+                                    ctx.drawImage(imgProxy, 0, 0);
+                                    canvas.toBlob((blob) => {
+                                        if (blob) {
+                                            blob.arrayBuffer().then(resolve).catch(reject);
+                                        } else {
+                                            reject(new Error("Blob conversion failed"));
+                                        }
+                                    }, 'image/png');
+                                } else {
+                                    reject(new Error("Canvas context failed"));
+                                }
+                            };
+                            imgProxy.onerror = () => {
+                                getBytesFromUrl(imgUrl).then(resolve).catch(reject);
+                            };
+                            imgProxy.src = proxiedUrl;
+                        } else {
+                            getBytesFromUrl(imgUrl).then(resolve).catch(reject);
+                        }
+                    };
+                    img.src = imgUrl;
+                });
+            };
+
+            if (isPdfFile && documentAttachment) {
+                // PDF processing path with pdf-lib - keeps 100% native selection & vector graphics!
+                setStatus("Signature et estampillage électronique vectoriel du PDF...");
+                
+                let originalPdfUrl = documentAttachment.url;
+                if (originalPdfUrl.startsWith('http://') || originalPdfUrl.startsWith('https://')) {
+                    originalPdfUrl = `/api/proxy-pdf?url=${encodeURIComponent(originalPdfUrl)}`;
+                }
+                const originalPdfBytes = await fetch(originalPdfUrl).then(res => res.arrayBuffer());
+                
+                // Load PDFDocument
+                const pdfDoc = await PDFDocument.load(originalPdfBytes);
+                
+                // Load signature & stamp as transparent PNG buffers
+                const [sigPngBytes, stampPngBytes] = await Promise.all([
+                    convertImageToPngBytes(user.signatureUrl),
+                    convertImageToPngBytes(user.stampUrl)
+                ]);
+                
+                const sigImage = await pdfDoc.embedPng(sigPngBytes);
+                const stampImage = await pdfDoc.embedPng(stampPngBytes);
+                
+                const pages = pdfDoc.getPages();
+                const lastPage = pages[pages.length - 1];
+                const { width, height } = lastPage.getSize();
+                
+                // Stamp official seal & signature on last page near bottom
+                const stampW = 100;
+                const stampH = 100;
+                const stampX = (width - stampW) / 2;
+                const stampY = 100;
+                
+                lastPage.drawImage(stampImage, {
+                    x: stampX,
+                    y: stampY,
+                    width: stampW,
+                    height: stampH
+                });
+                
+                const sigW = 110;
+                const sigH = 55;
+                const sigX = (width - sigW) / 2;
+                const sigY = stampY - 60; // place directly below stamp
+                
+                lastPage.drawImage(sigImage, {
+                    x: sigX,
+                    y: sigY,
+                    width: sigW,
+                    height: sigH
+                });
+                
+                const now = new Date();
+                const pad = (n: number) => n.toString().padStart(2, '0');
+                const formattedDate = `${pad(now.getDate())}/${pad(now.getMonth() + 1)}/${now.getFullYear()} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+                
+                const helveticaFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+                const dateText = `Certifié reçu le ${formattedDate}`;
+                const textWidth = helveticaFont.widthOfTextAtSize(dateText, 8);
+                const textX = (width - textWidth) / 2;
+                const textY = sigY - 15; // place directly below signature
+                
+                lastPage.drawText(dateText, {
+                    x: textX,
+                    y: textY,
+                    size: 8,
+                    font: helveticaFont,
+                    color: rgb(0.29, 0.33, 0.39), // gray-600
+                });
+                
+                const modifiedPdfBytes = await pdfDoc.save();
+                const blob = new Blob([modifiedPdfBytes], { type: "application/pdf" });
+                
+                const filename = `ACCUSE_RECEPTION_CERTIFIE_${conv.id.substring(0, 5).toUpperCase()}.pdf`;
+                const file = new File([blob], filename, { type: "application/pdf" });
+                
+                const downloadUrl = await uploadFile(file, `conversations/${conv.id}`);
+                const attObj: Attachment = {
+                    url: downloadUrl,
+                    name: "ACCUSÉ DE RÉCEPTION CERTIFIÉ.pdf",
+                    type: "application/pdf",
+                    size: blob.size,
+                    createdAt: new Date().toISOString()
+                };
+                
+                // Add message, update conversation, update related dossiers
+                await addDoc(collection(db, 'conversations', conv.id, 'messages'), {
+                    body: `🔒 ACCUSÉ DE RÉCEPTION CERTIFIÉ : Le contribuable a validé et signé électroniquement l'accusé de réception légal pour le document '${docName}' transmis par l'administration.`,
+                    participants: conv.participants,
+                    senderId: user.uid,
+                    senderName: "Accusé de Réception Certifié",
+                    receiverId: 'admin_dgi',
+                    attachments: [attObj],
+                    hasAttachments: true,
+                    createdAt: serverTimestamp(),
+                    conversationId: conv.id,
+                    isReceived: true,
+                    isRead: true
+                });
+
+                // Set certified on original message
+                if (lastAgentMsg) {
+                    try {
+                        await updateDoc(doc(db, 'conversations', conv.id, 'messages', lastAgentMsg.id), {
+                            isCertified: true,
+                            certifiedAt: serverTimestamp()
+                        });
+                    } catch (err) {
+                        console.error("Failed to mark original message as certified:", err);
+                    }
+                }
+                
+                await updateDoc(doc(db, 'conversations', conv.id), {
+                    pendingAcknowledgement: false,
+                    hasAttachments: true,
+                    isReadByDGI: false,
+                    isReadByContributor: true,
+                    lastMessagePreview: "🔒 Accusé de Réception Certifié signé par le contribuable.",
+                    lastUpdate: serverTimestamp()
+                });
+                
+                // Secure Attachment link in the related dossier
+                const dossiersRef = collection(db, 'ged_items');
+                const dossiersSnap = await getDocs(query(dossiersRef, where('linkedConversationId', '==', conv.id)));
+                
+                for (const dossierDoc of dossiersSnap.docs) {
+                    const dData = dossierDoc.data();
+                    const existingSecureAttachments = dData.secureAttachments || [];
+                    const logEntry = {
+                        id: Math.random().toString(36).slice(-6),
+                        authorId: user.uid,
+                        authorName: user.displayName || 'Espace Contribuable',
+                        authorRole: 'Contribuable',
+                        action: 'ACCUSE_RECEPTION_CERTIFIE',
+                        description: `Le contribuable a signé électroniquement l'accusé de réception certifié pour le document fiscal : '${docName}'.`,
+                        timestamp: new Date().toISOString()
+                    };
+                    const updatedLogs = [...(dData.historyLogs || []), logEntry];
+                    const updatedSecureAttachments = [...existingSecureAttachments, {
+                        url: downloadUrl,
+                        name: "ACCUSÉ DE RÉCEPTION CERTIFIÉ.pdf",
+                        type: "application/pdf",
+                        timestamp: new Date().toISOString()
+                    }];
+                    
+                    await updateDoc(dossierDoc.ref, {
+                        secureAttachments: updatedSecureAttachments,
+                        historyLogs: updatedLogs,
+                        updatedAt: serverTimestamp()
+                    });
+                }
+                
+                setUploading(false);
+                setStatus('');
+                alert("Accusé de réception enregistré, signé et transmis à la DGI avec succès !");
+                return;
+            }
+
+            // Fallback: Canvas-based generation for images or missing documents
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            
+            if (ctx) {
+                const loadPdfJs = (): Promise<any> => {
+                    return new Promise((resolvePdf, rejectPdf) => {
+                        if ((window as any).pdfjsLib) {
+                            resolvePdf((window as any).pdfjsLib);
+                            return;
+                        }
+                        const script = document.createElement('script');
+                        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js';
+                        script.onload = () => {
+                            const pdfjsLib = (window as any).pdfjsLib;
+                            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+                            resolvePdf(pdfjsLib);
+                        };
+                        script.onerror = () => rejectPdf(new Error("Failed to load PDF.js script"));
+                        document.body.appendChild(script);
+                    });
+                };
+
+                const loadImage = (src: string): Promise<HTMLImageElement> => {
+                    return new Promise((resolveImg) => {
+                        if (!src) {
+                            resolveImg(null as any);
+                            return;
+                        }
+                        const i = new window.Image();
+                        i.crossOrigin = "anonymous";
+                        i.onload = () => resolveImg(i);
+                        i.onerror = () => {
+                            const proxiedSrc = `/api/proxy-pdf?url=${encodeURIComponent(src)}`;
+                            const i2 = new window.Image();
+                            i2.crossOrigin = "anonymous";
+                            i2.onload = () => resolveImg(i2);
+                            i2.onerror = () => resolveImg(null as any);
+                            i2.src = proxiedSrc;
+                        };
+                        i.src = src;
+                    });
+                };
+
+                let originalDocRendered = false;
+                let renderedWidth = 800;
+                let renderedHeight = 1000;
+
+                if (documentAttachment) {
+                    const isPdf = documentAttachment.type === 'application/pdf' || 
+                                  documentAttachment.name?.toLowerCase().endsWith('.pdf') || 
+                                  documentAttachment.url?.toLowerCase().includes('.pdf');
+                    if (isPdf) {
+                        try {
+                            setStatus("Chargement et duplication du PDF d'origine...");
+                            const pdfjsLib = await loadPdfJs();
+                            let fetchUrl = documentAttachment.url;
+                            if (fetchUrl.startsWith('http://') || fetchUrl.startsWith('https://')) {
+                                fetchUrl = `/api/proxy-pdf?url=${encodeURIComponent(fetchUrl)}`;
+                            }
+                            const res = await fetch(fetchUrl);
+                            const resBlob = await res.blob();
+                            const arrayBuf = await resBlob.arrayBuffer();
+                            const pdfData = new Uint8Array(arrayBuf);
+
+                            const loadingTask = pdfjsLib.getDocument({ data: pdfData });
+                            const pdfDocument = await loadingTask.promise;
+                            const page = await pdfDocument.getPage(1);
+                            
+                            const viewport = page.getViewport({ scale: 1.5 });
+                            renderedWidth = Math.round(viewport.width);
+                            renderedHeight = Math.round(viewport.height);
+
+                            canvas.width = renderedWidth;
+                            canvas.height = renderedHeight + 200; // signature banner at the bottom
+
+                            ctx.fillStyle = '#FFFFFF';
+                            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                            // render PDF page
+                            await page.render({ canvasContext: ctx, viewport }).promise;
+                            originalDocRendered = true;
+                        } catch (pdfErr) {
+                            console.error("Failed to render PDF page onto receipt:", pdfErr);
+                        }
+                    } else {
+                        // It's an image
+                        try {
+                            setStatus("Chargement et duplication de l'image d'origine...");
+                            const docImg = await loadImage(documentAttachment.url);
+                            if (docImg) {
+                                const scale = 800 / docImg.width;
+                                renderedWidth = 800;
+                                renderedHeight = Math.round(docImg.height * scale);
+
+                                canvas.width = renderedWidth;
+                                canvas.height = renderedHeight + 200;
+
+                                ctx.fillStyle = '#FFFFFF';
+                                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                                ctx.drawImage(docImg, 0, 0, renderedWidth, renderedHeight);
+                                originalDocRendered = true;
+                            }
+                        } catch (imgErr) {
+                            console.error("Failed to render image onto receipt:", imgErr);
+                        }
+                    }
+                }
+
+                if (originalDocRendered) {
+                    // Vertical stamp stack at bottom
+                    const sigBlockY = renderedHeight;
+                    const sigBlockHeight = 200;
+
+                    ctx.fillStyle = '#FFFFFF';
+                    ctx.fillRect(0, sigBlockY, renderedWidth, sigBlockHeight);
+
+                    const [sigImg, stampImg] = await Promise.all([
+                        loadImage(user.signatureUrl),
+                        loadImage(user.stampUrl)
+                    ]);
+
+                    // Element 1 (Top): Le Sceau
+                    const sealSize = 100;
+                    const sealX = Math.round((renderedWidth - sealSize) / 2);
+                    const sealY = sigBlockY + 15;
+
+                    if (stampImg) {
+                        ctx.drawImage(stampImg, sealX, sealY, sealSize, sealSize);
+                    }
+
+                    // Element 2 (Middle): La Signature DG
+                    const sigW = 110;
+                    const sigH = 55;
+                    const sigX = Math.round((renderedWidth - sigW) / 2);
+                    const sigY = sealY + sealSize + 10;
+
+                    if (sigImg) {
+                        ctx.drawImage(sigImg, sigX, sigY, sigW, sigH);
+                    }
+
+                    // Ligne 3 (Bas)
+                    const now = new Date();
+                    const pad = (n: number) => n.toString().padStart(2, '0');
+                    const formattedDate = `${pad(now.getDate())}/${pad(now.getMonth() + 1)}/${now.getFullYear()} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+
+                    ctx.fillStyle = '#4B5563';
+                    ctx.font = 'normal 8px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(`Certifié reçu le ${formattedDate}`, renderedWidth / 2, sigY + sigH + 15);
+
+                } else {
+                    // Fallback block if document rendering failed or is absent
+                    canvas.width = 800;
+                    canvas.height = 350;
+
+                    ctx.fillStyle = '#FFFFFF';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    
+                    ctx.fillStyle = '#111827';
+                    ctx.font = 'bold 14px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.fillText("ACCUSÉ DE RECEPTION CERTIFIÉ", canvas.width / 2, 40);
+
+                    ctx.fillStyle = '#4B5563';
+                    ctx.font = 'normal 11px sans-serif';
+                    ctx.fillText(`Document : ${docName}`, canvas.width / 2, 70);
+                    ctx.fillText(`ID Conversation : ${conv.id.toUpperCase()}`, canvas.width / 2, 90);
+
+                    const [sigImg, stampImg] = await Promise.all([
+                        loadImage(user.signatureUrl),
+                        loadImage(user.stampUrl)
+                    ]);
+
+                    // Element 1 (Top): Sceau
+                    const sealSize = 100;
+                    const sealX = Math.round((canvas.width - sealSize) / 2);
+                    const sealY = 110;
+
+                    if (stampImg) {
+                        ctx.drawImage(stampImg, sealX, sealY, sealSize, sealSize);
+                    }
+
+                    // Element 2 (Middle): Signature
+                    const sigW = 110;
+                    const sigH = 55;
+                    const sigX = Math.round((canvas.width - sigW) / 2);
+                    const sigY = sealY + sealSize + 10;
+
+                    if (sigImg) {
+                        ctx.drawImage(sigImg, sigX, sigY, sigW, sigH);
+                    }
+
+                    // Ligne 3 (Bas)
+                    const now = new Date();
+                    const pad = (n: number) => n.toString().padStart(2, '0');
+                    const formattedDate = `${pad(now.getDate())}/${pad(now.getMonth() + 1)}/${now.getFullYear()} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+
+                    ctx.fillStyle = '#4B5563';
+                    ctx.font = 'normal 8px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(`Certifié reçu le ${formattedDate}`, canvas.width / 2, sigY + sigH + 15);
+                }
+            }
+            
+            canvas.toBlob(async (blob) => {
+                if (!blob) throw new Error("Could not construct canvas blob");
+                try {
+                    const filename = `ACCUSE_RECEPTION_CERTIFIE_${conv.id.substring(0, 5).toUpperCase()}.png`;
+                    const file = new File([blob], filename, { type: "image/png" });
+                    
+                    const downloadUrl = await uploadFile(file, `conversations/${conv.id}`);
+                    const attObj: Attachment = {
+                        url: downloadUrl,
+                        name: "ACCUSÉ DE RÉCEPTION CERTIFIÉ.png",
+                        type: "image/png",
+                        size: blob.size,
+                        createdAt: new Date().toISOString()
+                    };
+                    
+                    await addDoc(collection(db, 'conversations', conv.id, 'messages'), {
+                        body: `🔒 ACCUSÉ DE RÉCEPTION CERTIFIÉ : Le contribuable a validé et signé électroniquement l'accusé de réception légal pour le document '${docName}' transmis par l'administration.`,
+                        participants: conv.participants,
+                        senderId: user.uid,
+                        senderName: "Accusé de Réception Certifié",
+                        receiverId: 'admin_dgi',
+                        attachments: [attObj],
+                        hasAttachments: true,
+                        createdAt: serverTimestamp(),
+                        conversationId: conv.id
+                    });
+                    
+                    await updateDoc(doc(db, 'conversations', conv.id), {
+                        pendingAcknowledgement: false,
+                        hasAttachments: true,
+                        isReadByDGI: false,
+                        isReadByContributor: true,
+                        lastMessagePreview: "🔒 Accusé de Réception Certifié signé par le contribuable.",
+                        lastUpdate: serverTimestamp()
+                    });
+                    
+                    // Secure Attachment link in the related dossier
+                    const dossiersRef = collection(db, 'ged_items');
+                    const dossiersSnap = await getDocs(query(dossiersRef, where('linkedConversationId', '==', conv.id)));
+                    
+                    for (const dossierDoc of dossiersSnap.docs) {
+                        const dData = dossierDoc.data();
+                        const existingSecureAttachments = dData.secureAttachments || [];
+                        const logEntry = {
+                            id: Math.random().toString(36).slice(-6),
+                            authorId: user.uid,
+                            authorName: user.displayName || 'Espace Contribuable',
+                            authorRole: 'Contribuable',
+                            action: 'ACCUSE_RECEPTION_CERTIFIE',
+                            description: `Le contribuable a signé électroniquement l'accusé de réception certifié pour le document fiscal : '${docName}'.`,
+                            timestamp: new Date().toISOString()
+                        };
+                        const updatedLogs = [...(dData.historyLogs || []), logEntry];
+                        const updatedSecureAttachments = [...existingSecureAttachments, {
+                            url: downloadUrl,
+                            name: "ACCUSÉ DE RÉCEPTION CERTIFIÉ.png",
+                            type: "image/png",
+                            timestamp: new Date().toISOString()
+                        }];
+                        
+                        await updateDoc(dossierDoc.ref, {
+                            secureAttachments: updatedSecureAttachments,
+                            historyLogs: updatedLogs,
+                            updatedAt: serverTimestamp()
+                        });
+                    }
+                    
+                    setUploading(false);
+                    setStatus('');
+                    alert("Accusé de réception enregistré, signé et transmis à la DGI avec succès !");
+                } catch (innerErr: any) {
+                    console.error("Inner cert generation crash:", innerErr);
+                    alert("Erreur de validation de l'accusé: " + innerErr.message);
+                    setUploading(false);
+                    setStatus('');
+                }
+            }, 'image/png');
+        } catch (err: any) {
+            console.error("Accept acknowledgement error", err);
+            alert("Erreur de validation de l'accusé: " + err.message);
+            setUploading(false);
+            setStatus('');
+        }
     };
 
     const confirmDelete = (conv: Conversation) => {
@@ -2777,6 +3514,13 @@ const MessagingPage = () => {
                                             )}>
                                                 <div className="flex flex-col gap-3">
                                                     <p className="text-xs md:text-sm font-medium leading-relaxed whitespace-pre-wrap">{msg.body}</p>
+                                                    {msg.isCertified && (
+                                                        <div className="mt-2.5 flex items-center gap-1.5 bg-green-150 border border-green-200 px-3 py-1.5 rounded-xl w-fit">
+                                                            <span className="text-[9px] text-green-800 font-extrabold uppercase tracking-widest flex items-center gap-1 select-none">
+                                                                🛡️ Réception Certifiée par le Contribuable
+                                                            </span>
+                                                        </div>
+                                                    )}
                                                 </div>
                                                 
                                                 {msg.attachments && msg.attachments.length > 0 && (
@@ -2838,10 +3582,21 @@ const MessagingPage = () => {
                                                     </div>
                                                 )}
                                                 <span className={cn(
-                                                    "absolute bottom-[-20px] text-[8px] font-bold uppercase tracking-widest opacity-40 whitespace-nowrap",
+                                                    "absolute bottom-[-20px] text-[8px] font-bold uppercase tracking-widest opacity-40 whitespace-nowrap flex items-center gap-1.5",
                                                     isMe ? "right-2" : "left-2"
                                                 )}>
-                                                    {msg.createdAt?.toDate().toLocaleString('fr-FR', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}
+                                                    {msg.createdAt?.toDate ? msg.createdAt.toDate().toLocaleString('fr-FR', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : new Date().toLocaleString('fr-FR', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}
+                                                    {isMe && (
+                                                        <span className="text-[10px] select-none" title={msg.isRead ? "Lu par le destinataire" : msg.isReceived ? "Reçu par le destinataire" : "Envoyé"}>
+                                                            {msg.isRead ? (
+                                                                <span className="text-blue-500 font-extrabold">✓✓</span>
+                                                            ) : msg.isReceived ? (
+                                                                <span className="text-gray-400 font-extrabold font-black">✓✓</span>
+                                                            ) : (
+                                                                <span className="text-gray-400">✓</span>
+                                                            )}
+                                                        </span>
+                                                    )}
                                                 </span>
                                             </div>
                                         </div>
@@ -2849,6 +3604,20 @@ const MessagingPage = () => {
                                 })
                             )}
                         </div>
+
+                        {user?.role === 'contributor' && selectedConv?.pendingAcknowledgement && (
+                            <div className="p-8 mx-8 mb-8 bg-red-50 border-2 border-dashed border-red-200 rounded-[2.5rem] flex flex-col items-center justify-center text-center gap-3 animate-in fade-in slide-in-from-bottom duration-500 shrink-0">
+                                <div className="w-12 h-12 bg-red-650 text-white rounded-2xl flex items-center justify-center shadow-lg shadow-red-650/20">
+                                    <ShieldLock size={24} />
+                                </div>
+                                <div className="max-w-md">
+                                    <h4 className="text-sm font-black text-red-700 uppercase tracking-wider">Discussion Verrouillée de Sécurité</h4>
+                                    <p className="text-[10px] text-red-650 font-bold uppercase tracking-widest mt-1">
+                                        Vous devez obligatoirement accuser réception des documents officiels transmis par l'administration avant de pouvoir poursuivre l'échange.
+                                    </p>
+                                </div>
+                            </div>
+                        )}
 
                         <footer className="p-6 md:p-10 border-t border-gray-100 bg-gray-50/30 flex flex-wrap items-center justify-center gap-3 md:gap-6 shrink-0">
                              <button 
@@ -2858,12 +3627,22 @@ const MessagingPage = () => {
                                 <X size={14} className="sm:hidden" /> Fermer
                             </button>
 
-                            <button 
-                                onClick={() => handleReply(selectedConv)}
-                                className="px-6 py-3 md:px-10 md:py-4 bg-primary text-white font-black text-[9px] md:text-[10px] uppercase tracking-widest rounded-xl md:rounded-2xl shadow-xl shadow-primary/20 hover:brightness-110 active:scale-95 transition-all flex items-center gap-2"
-                            >
-                                <Send size={14} /> Répondre
-                            </button>
+                            {user?.role === 'contributor' && selectedConv?.pendingAcknowledgement ? (
+                                <button 
+                                    onClick={() => handleAcceptAcknowledgement(selectedConv)}
+                                    className="px-8 py-4 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white font-black text-xs uppercase tracking-widest rounded-2xl shadow-2xl shadow-red-500/30 animate-pulse flex items-center gap-2.5 transition-all cursor-pointer border border-transparent"
+                                >
+                                    <ShieldLock size={16} />
+                                    <span>⚠️ Confirmer l'Accusé de Réception</span>
+                                </button>
+                            ) : (
+                                <button 
+                                    onClick={() => handleReply(selectedConv)}
+                                    className="px-6 py-3 md:px-10 md:py-4 bg-primary text-white font-black text-[9px] md:text-[10px] uppercase tracking-widest rounded-xl md:rounded-2xl shadow-xl shadow-primary/20 hover:brightness-110 active:scale-95 transition-all flex items-center gap-2"
+                                >
+                                    <Send size={14} /> Répondre
+                                </button>
+                            )}
 
                             {(user?.role === 'admin' || user?.role === 'agent') && (
                                 <button 
@@ -3050,6 +3829,7 @@ const SettingsPage = () => {
     const { user, isAdminMode } = useAuth();
     const navigate = useNavigate();
     const [status, setStatus] = useState('');
+    const [showScannerForProfileAsset, setShowScannerForProfileAsset] = useState<'signature' | 'stamp' | null>(null);
     const [agents, setAgents] = useState<AppUser[]>([]);
     const [agentTab, setAgentTab] = useState<'active' | 'trash'>('active');
     const [uploading, setUploading] = useState<string | null>(null);
@@ -3086,19 +3866,51 @@ const SettingsPage = () => {
         setStatus("Traitement de la signature/cachet...");
         try {
             const fieldName = type === 'signature' ? 'signatureUrl' : 'stampUrl';
+            const emailClean = user.email.toLowerCase().trim();
+
+            // 1. Update the 'users' document
             await updateDoc(doc(db, 'users', user.uid), {
                 [fieldName]: dataUrl,
                 updatedAt: serverTimestamp()
             });
 
-            // Also search if exists in agents collection and update
-            const agentsRef = collection(db, 'agents');
-            const agentSnap = await getDocs(query(agentsRef, where('email', '==', user.email.toLowerCase().trim())));
-            if (!agentSnap.empty) {
-                await updateDoc(agentSnap.docs[0].ref, {
+            // 2. Update the 'contribuables' document using active session's email address as the core document ID
+            try {
+                const taxpayerEmailDocRef = doc(db, 'contribuables', emailClean);
+                await setDoc(taxpayerEmailDocRef, {
+                    uid: user.uid,
+                    email: emailClean,
+                    companyName: user.companyName || user.displayName || '',
+                    taxNumber: user.taxNumber || '',
+                    role: 'contributor',
                     [fieldName]: dataUrl,
                     updatedAt: serverTimestamp()
-                });
+                }, { merge: true });
+            } catch (errTaxpayerEmail) {
+                console.error("Failed to write signature/stamp to contribuables by email ID:", errTaxpayerEmail);
+            }
+
+            // 3. Update the 'contribuables' document by user UID if it exists/needed
+            try {
+                const taxpayerUidDocRef = doc(db, 'contribuables', user.uid);
+                await setDoc(taxpayerUidDocRef, {
+                    [fieldName]: dataUrl,
+                    updatedAt: serverTimestamp()
+                }, { merge: true });
+            } catch (errTaxpayerUid) {
+                // Ignore if it doesn't exist
+            }
+
+            // 4. If agent or admin, update the 'agents' collection document
+            if (user.role === 'admin' || user.role === 'agent') {
+                const agentsRef = collection(db, 'agents');
+                const agentSnap = await getDocs(query(agentsRef, where('email', '==', emailClean)));
+                if (!agentSnap.empty) {
+                    await updateDoc(agentSnap.docs[0].ref, {
+                        [fieldName]: dataUrl,
+                        updatedAt: serverTimestamp()
+                    });
+                }
             }
 
             setStatus(`Votre ${type === 'signature' ? 'signature' : 'cachet'} a été mis à jour.`);
@@ -4193,24 +5005,27 @@ const SettingsPage = () => {
                                         {user.perimetre.replace('_', ' ').toUpperCase()}
                                     </span>
                                 )}
-                                <span className="px-4 py-1.5 bg-green-500 text-white rounded-full text-[10px] font-black uppercase tracking-[0.1em] shadow-lg shadow-green-500/20">
-                                    ACTIF
-                                </span>
                             </div>
                         </div>
                     </div>
 
                     {/* Signature Électronique & Cachet Section */}
                     <div className="mt-8 border-t border-gray-100 pt-8">
-                        <h3 className="text-sm font-black text-[#2C3E50] uppercase tracking-wider mb-2">Signature Électronique & Cachet du Bureau (Détorage Luminescent)</h3>
+                        <h3 className="text-sm font-black text-[#2C3E50] uppercase tracking-wider mb-2">
+                            {user?.role === 'contributor' ? "Signature DG & Sceau d'Entreprise (Identité Fiscale)" : "Signature Électronique & Cachet du Bureau (Détorage Luminescent)"}
+                        </h3>
                         <p className="text-xs text-gray-400 mb-6 leading-relaxed">
-                            Téléchargez un scan ou une photo de votre signature ou cachet officiel. Notre processeur de luminance local va isoler l'encre (seuil de blanc) pour rendre le fond 100% transparent.
+                            {user?.role === 'contributor' 
+                                ? "Téléchargez l'image ou numérisez par caméra la signature du Directeur Général ainsi que le sceau d'entreprise officiel. Les fonds blancs seront automatiquement détourés." 
+                                : "Téléchargez un scan ou une photo de votre signature ou cachet officiel. Notre processeur de luminance local va isoler l'encre (seuil de blanc) pour rendre le fond 100% transparent."}
                         </p>
                         
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                             {/* Signature Component */}
                             <div className="p-6 bg-gray-50 rounded-3xl border border-gray-100 flex flex-col items-center justify-center text-center">
-                                <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-4">Votre Signature Numérique</p>
+                                <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-4">
+                                    {user?.role === 'contributor' ? "Signature DG officielle (Représentant Légal)" : "Votre Signature Numérique"}
+                                </p>
                                 <div className="w-full h-32 bg-white border-2 border-dashed border-gray-200 rounded-2xl flex items-center justify-center relative overflow-hidden select-none">
                                     {user?.signatureUrl ? (
                                         <div className="absolute inset-0 bg-[radial-gradient(#e5e7eb_1px,transparent_1px)] [background-size:16px_16px] flex items-center justify-center p-3">
@@ -4219,11 +5034,13 @@ const SettingsPage = () => {
                                     ) : (
                                         <div className="text-gray-400 flex flex-col items-center p-4">
                                             <svg className="w-8 h-8 mb-2 stroke-current opacity-40" viewBox="0 0 24 24" fill="none" strokeWidth="2"><path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
-                                            <span className="text-[9px] font-black uppercase tracking-wider text-gray-400">Aucune signature chargée</span>
+                                            <span className="text-[9px] font-black uppercase tracking-wider text-gray-400">
+                                                {user?.role === 'contributor' ? "Aucune signature DG chargée" : "Aucune signature chargée"}
+                                            </span>
                                         </div>
                                     )}
                                 </div>
-                                <div className="mt-4 flex gap-2">
+                                <div className="mt-4 flex flex-wrap gap-2 justify-center">
                                     <label className="px-4 py-2 bg-[#2C3E50] text-white text-[10px] font-black uppercase tracking-widest rounded-xl cursor-pointer hover:bg-opacity-95 transition-all">
                                         Charger JPEG/PNG
                                         <input type="file" accept="image/*" className="hidden" onChange={(e) => {
@@ -4231,20 +5048,30 @@ const SettingsPage = () => {
                                             if (file) handleImageDeterage(file, 'signature');
                                         }} />
                                     </label>
+                                    <button 
+                                        type="button"
+                                        onClick={() => setShowScannerForProfileAsset('signature')}
+                                        className="px-4 py-2 bg-teal-600 hover:bg-teal-700 active:bg-teal-800 text-white text-[10px] font-black uppercase tracking-widest rounded-xl transition-all shadow-xs active:scale-97 cursor-pointer flex items-center gap-1.5"
+                                        title="Utiliser la caméra pour numériser votre signature"
+                                    >
+                                        📸 Scanner un élément
+                                    </button>
                                     {user?.signatureUrl && (
                                         <button 
                                             onClick={() => handleSaveUserSignatureOrStamp('signature', '')}
-                                            className="px-4 py-2 bg-white text-red-500 font-bold text-[10px] uppercase tracking-widest rounded-xl border border-gray-200 hover:bg-red-50 transition-all"
+                                            className="px-4 py-2 bg-white text-orange-600 border-orange-200 font-bold text-[10px] uppercase tracking-widest rounded-xl border hover:bg-orange-50 transition-all"
                                         >
                                             Effacer
                                         </button>
                                     )}
                                 </div>
                             </div>
-
+ 
                             {/* Cachet Component */}
                             <div className="p-6 bg-gray-50 rounded-3xl border border-gray-100 flex flex-col items-center justify-center text-center">
-                                <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-4">Cachet Officiel du Bureau</p>
+                                <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-4">
+                                    {user?.role === 'contributor' ? "Sceau / Tampon de l'Entreprise (Certifié)" : "Cachet Officiel du Bureau"}
+                                </p>
                                 <div className="w-full h-32 bg-white border-2 border-dashed border-gray-200 rounded-2xl flex items-center justify-center relative overflow-hidden select-none">
                                     {user?.stampUrl ? (
                                         <div className="absolute inset-0 bg-[radial-gradient(#e5e7eb_1px,transparent_1px)] [background-size:16px_16px] flex items-center justify-center p-3">
@@ -4253,11 +5080,13 @@ const SettingsPage = () => {
                                     ) : (
                                         <div className="text-gray-400 flex flex-col items-center p-4">
                                             <svg className="w-8 h-8 mb-2 stroke-current opacity-40" viewBox="0 0 24 24" fill="none" strokeWidth="2"><circle cx="12" cy="12" r="10"/><path d="m14.5 11.5-2.5 2.5-2.5-2.5"/></svg>
-                                            <span className="text-[9px] font-black uppercase tracking-wider text-gray-400">Aucun cachet de service</span>
+                                            <span className="text-[9px] font-black uppercase tracking-wider text-gray-400">
+                                                {user?.role === 'contributor' ? "Aucun sceau d'entreprise chargé" : "Aucun cachet de service"}
+                                            </span>
                                         </div>
                                     )}
                                 </div>
-                                <div className="mt-4 flex gap-2">
+                                <div className="mt-4 flex flex-wrap gap-2 justify-center">
                                     <label className="px-4 py-2 bg-[#2C3E50] text-white text-[10px] font-black uppercase tracking-widest rounded-xl cursor-pointer hover:bg-opacity-95 transition-all">
                                         Charger JPEG/PNG
                                         <input type="file" accept="image/*" className="hidden" onChange={(e) => {
@@ -4265,10 +5094,18 @@ const SettingsPage = () => {
                                             if (file) handleImageDeterage(file, 'stamp');
                                         }} />
                                     </label>
+                                    <button 
+                                        type="button"
+                                        onClick={() => setShowScannerForProfileAsset('stamp')}
+                                        className="px-4 py-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white text-[10px] font-black uppercase tracking-widest rounded-xl transition-all shadow-xs active:scale-97 cursor-pointer flex items-center gap-1.5"
+                                        title="Utiliser la caméra pour numériser le cachet"
+                                    >
+                                        📸 Scanner un élément
+                                    </button>
                                     {user?.stampUrl && (
                                         <button 
                                             onClick={() => handleSaveUserSignatureOrStamp('stamp', '')}
-                                            className="px-4 py-2 bg-white text-red-500 font-bold text-[10px] uppercase tracking-widest rounded-xl border border-gray-200 hover:bg-red-50 transition-all"
+                                            className="px-4 py-2 bg-white text-orange-600 border-orange-200 font-bold text-[10px] uppercase tracking-widest rounded-xl border hover:bg-orange-50 transition-all"
                                         >
                                             Effacer
                                         </button>
@@ -4670,6 +5507,24 @@ const SettingsPage = () => {
                         </div>
                     </div>
                 )}
+
+                {showScannerForProfileAsset && (
+                    <DocumentScanner 
+                        onClose={() => setShowScannerForProfileAsset(null)} 
+                        title={showScannerForProfileAsset === 'signature' ? "Scanner Signature Manuscrite" : "Scanner Sceau / Cachet Officiel"}
+                        forceSingleImageOnly={true}
+                        onScanComplete={async (file) => {
+                            try {
+                                setStatus("Traitement du détourage de l'image de la caméra...");
+                                handleImageDeterage(file, showScannerForProfileAsset);
+                                setShowScannerForProfileAsset(null);
+                            } catch (e: any) {
+                                console.error(e);
+                                setStatus("Erreur de numérisation: " + (e.message || e));
+                            }
+                        }}
+                    />
+                )}
             </div>
         </div>
     );
@@ -4678,42 +5533,7 @@ const SettingsPage = () => {
 const LoginPage = () => {
     const { loginWithGoogle, authActionLoading } = useAuth();
     const { theme } = useTheme();
-    const [view, setView] = useState<'login' | 'register'>('login');
     const [loginTab, setLoginTab] = useState<'agent' | 'taxpayer'>('agent');
-    
-    // Taxpayer Registration Form States - Zero Password, Google Only
-    const [regData, setRegData] = useState({ nif: '', name: '' });
-    const [regLoading, setRegLoading] = useState(false);
-    const [regError, setRegError] = useState('');
-
-    const handleTaxpayerGoogleSignup = async (e: React.FormEvent) => {
-        e.preventDefault();
-        if (!regData.nif.trim()) {
-            setRegError('Le Numéro d’Impôt (NIF) est requis.');
-            return;
-        }
-        if (!regData.name.trim()) {
-            setRegError('La Raison Sociale / Nom professionnel est requis.');
-            return;
-        }
-        setRegLoading(true);
-        setRegError('');
-        try {
-            // Store taxpayer registration details in localStorage so onAuthStateChanged can pick it up
-            localStorage.setItem('pending_taxpayer_reg', JSON.stringify({
-                taxNumber: regData.nif.trim(),
-                companyName: regData.name.trim()
-            }));
-            
-            // Connect with Google to complete profile
-            await loginWithGoogle();
-        } catch (err: any) {
-            setRegError(err.message || 'Erreur lors de la connexion Google.');
-            localStorage.removeItem('pending_taxpayer_reg');
-        } finally {
-            setRegLoading(false);
-        }
-    };
 
     return (
         <div className="h-screen w-screen flex flex-col items-center justify-center bg-[#F4F7F6] p-8 font-sans overflow-hidden">
@@ -4743,155 +5563,96 @@ const LoginPage = () => {
                         </p>
                     </header>
 
-                    {view === 'login' ? (
-                        <div className="space-y-6">
-                            {/* Dual Tabs for Login Type */}
-                            <div className="flex bg-gray-50 p-1.5 rounded-2xl border border-gray-100 mb-4">
-                                <button
-                                    onClick={() => { setLoginTab('agent'); setRegError(''); }}
-                                    className={cn(
-                                        "flex-1 py-3 text-[10px] font-black uppercase tracking-widest rounded-xl transition-all",
-                                        loginTab === 'agent' 
-                                            ? "bg-white text-primary shadow-sm ring-1 ring-black/5" 
-                                            : "text-gray-400 hover:text-gray-600"
-                                    )}
-                                >
-                                    Espace Métier (Agent)
-                                </button>
-                                <button
-                                    onClick={() => { setLoginTab('taxpayer'); setRegError(''); }}
-                                    className={cn(
-                                        "flex-1 py-3 text-[10px] font-black uppercase tracking-widest rounded-xl transition-all",
-                                        loginTab === 'taxpayer' 
-                                            ? "bg-white text-primary shadow-sm ring-1 ring-black/5" 
-                                            : "text-gray-400 hover:text-gray-600"
-                                    )}
-                                >
-                                    Espace Contribuable
-                                </button>
-                            </div>
-
-                            {loginTab === 'agent' ? (
-                                <div className="space-y-6 animate-in fade-in duration-300">
-                                    <p className="text-center text-[10px] text-gray-400 font-bold uppercase tracking-widest leading-relaxed max-w-xs mx-auto text-primary">
-                                        ACCÈS SÉCURISÉ AGENTS & CADRES DGI
-                                    </p>
-                                    <p className="text-center text-[10px] text-gray-400 font-medium leading-relaxed max-w-xs mx-auto">
-                                        Connexion instantanée sans mot de passe via votre adresse e-mail professionnelle certifiée.
-                                    </p>
-                                    <button 
-                                        onClick={loginWithGoogle}
-                                        disabled={authActionLoading}
-                                        className={cn(
-                                            "w-full group flex items-center justify-center gap-6 px-10 py-6 bg-white border-2 border-primary/20 rounded-3xl hover:border-primary hover:bg-primary/5 transition-all shadow-xl shadow-primary/5 hover:shadow-primary/10 active:scale-[0.98]",
-                                            authActionLoading && "opacity-50 cursor-not-allowed"
-                                        )}
-                                    >
-                                        {authActionLoading ? (
-                                            <RefreshCw className="animate-spin text-primary" size={24} />
-                                        ) : (
-                                            <div className="w-8 h-8 rounded-full overflow-hidden shrink-0">
-                                                <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="G" className="w-full h-full" />
-                                            </div>
-                                        )}
-                                        <span className="text-[10px] font-black text-primary uppercase tracking-[0.15em] transition-colors">
-                                            {authActionLoading ? "Authentification..." : "Connexion Professionnelle Google"}
-                                        </span>
-                                    </button>
-                                </div>
-                            ) : (
-                                <div className="space-y-6 animate-in fade-in duration-300">
-                                    <p className="text-center text-[10px] text-gray-400 font-medium leading-relaxed max-w-xs mx-auto">
-                                        Espace dédié aux contribuables de la RDC. Connectez-vous instantanément et de façon sécurisée via Google. Ce portail ne requiert aucun mot de passe.
-                                    </p>
-                                    <button 
-                                        onClick={loginWithGoogle}
-                                        disabled={authActionLoading}
-                                        className={cn(
-                                            "w-full group flex items-center justify-center gap-6 px-10 py-6 bg-white border-2 border-gray-100 rounded-3xl hover:border-primary hover:bg-gray-50 transition-all shadow-xl shadow-gray-200/50 hover:shadow-primary/10 active:scale-[0.98]",
-                                            authActionLoading && "opacity-50 cursor-not-allowed"
-                                        )}
-                                    >
-                                        {authActionLoading ? (
-                                            <RefreshCw className="animate-spin text-primary" size={24} />
-                                        ) : (
-                                            <div className="w-8 h-8 rounded-full overflow-hidden shrink-0">
-                                                <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="G" className="w-full h-full" />
-                                            </div>
-                                        )}
-                                        <span className="text-[10px] font-black text-[#2C3E50] uppercase tracking-[0.15em] transition-colors">
-                                            {authActionLoading ? "Connexion en cours..." : "Se connecter via Google"}
-                                        </span>
-                                    </button>
-                                </div>
-                            )}
-
-                            <div className="relative flex items-center py-4">
-                                <div className="flex-grow border-t border-gray-100"></div>
-                                <span className="flex-shrink mx-4 text-[9px] font-black text-gray-300 uppercase tracking-widest">Nouveau contribuable ?</span>
-                                <div className="flex-grow border-t border-gray-100"></div>
-                            </div>
-
-                            <button 
-                                onClick={() => setView('register')}
-                                className="w-full py-5 bg-primary/5 text-primary border border-primary/10 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-primary/10 transition-colors"
+                    <div className="space-y-6">
+                        {/* Dual Tabs for Login Type */}
+                        <div className="flex bg-gray-50 p-1.5 rounded-2xl border border-gray-100 mb-4">
+                            <button
+                                onClick={() => setLoginTab('agent')}
+                                className={cn(
+                                    "flex-1 py-3 text-[10px] font-black uppercase tracking-widest rounded-xl transition-all",
+                                    loginTab === 'agent' 
+                                        ? "bg-white text-primary shadow-sm ring-1 ring-black/5" 
+                                        : "text-gray-400 hover:text-gray-600"
+                                )}
                             >
-                                Créer un compte Contribuable
+                                Espace Métier (Agent)
+                            </button>
+                            <button
+                                onClick={() => setLoginTab('taxpayer')}
+                                className={cn(
+                                    "flex-1 py-3 text-[10px] font-black uppercase tracking-widest rounded-xl transition-all",
+                                    loginTab === 'taxpayer' 
+                                        ? "bg-white text-primary shadow-sm ring-1 ring-black/5" 
+                                        : "text-gray-400 hover:text-gray-600"
+                                )}
+                            >
+                                Espace Contribuable
                             </button>
                         </div>
-                    ) : (
-                        <form onSubmit={handleTaxpayerGoogleSignup} className="space-y-5 animate-in slide-in-from-right duration-500">
-                             <div className="space-y-4">
-                                <div className="relative">
-                                    <input 
-                                        required
-                                        placeholder="Numéro Impôt (NIF)"
-                                        className="w-full pl-6 pr-6 py-4 bg-gray-50 border border-gray-100 rounded-xl outline-none focus:ring-4 focus:ring-primary/5 text-xs font-bold"
-                                        value={regData.nif}
-                                        onChange={e => setRegData({...regData, nif: e.target.value})}
-                                    />
-                                </div>
-                                <div className="relative">
-                                    <input 
-                                        required
-                                        placeholder="Raison Sociale / Informations Professionnelles"
-                                        className="w-full pl-6 pr-6 py-4 bg-gray-50 border border-gray-100 rounded-xl outline-none focus:ring-4 focus:ring-primary/5 text-xs font-bold"
-                                        value={regData.name}
-                                        onChange={e => setRegData({...regData, name: e.target.value})}
-                                    />
-                                </div>
-                            </div>
 
-                            {regError && (
-                                <div className="p-4 bg-red-50 rounded-xl flex items-center gap-2 text-red-600 border border-red-100">
-                                    <AlertCircle size={14} />
-                                    <p className="text-[10px] font-black uppercase tracking-tight">{regError}</p>
-                                </div>
-                            )}
-
-                            <div className="flex gap-4">
+                        {loginTab === 'agent' ? (
+                            <div className="space-y-6 animate-in fade-in duration-300">
+                                <p className="text-center text-[10px] text-gray-400 font-bold uppercase tracking-widest leading-relaxed max-w-xs mx-auto text-primary">
+                                    ACCÈS SÉCURISÉ AGENTS & CADRES DGI
+                                </p>
+                                <p className="text-center text-[10px] text-gray-400 font-medium leading-relaxed max-w-xs mx-auto">
+                                    Connexion instantanée sans mot de passe via votre adresse e-mail professionnelle certifiée Google.
+                                </p>
                                 <button 
-                                    type="button"
-                                    onClick={() => setView('login')}
-                                    className="flex-1 py-4 text-[10px] font-black text-gray-400 border border-gray-100 rounded-xl uppercase tracking-widest hover:bg-gray-50"
+                                    onClick={loginWithGoogle}
+                                    disabled={authActionLoading}
+                                    className={cn(
+                                        "w-full group flex items-center justify-center gap-6 px-10 py-6 bg-white border-2 border-primary/20 rounded-3xl hover:border-primary hover:bg-primary/5 transition-all shadow-xl shadow-primary/5 hover:shadow-primary/10 active:scale-[0.98]",
+                                        authActionLoading && "opacity-50 cursor-not-allowed"
+                                    )}
                                 >
-                                    Retour
-                                </button>
-                                <button 
-                                    type="submit"
-                                    disabled={regLoading || authActionLoading}
-                                    className="flex-1 py-4 bg-primary text-white rounded-xl text-[10px] font-black uppercase tracking-widest shadow-xl shadow-primary/20 hover:brightness-110 disabled:opacity-50 flex items-center justify-center gap-2"
-                                >
-                                    {regLoading ? "Activation..." : "S'associer à Google"}
+                                    {authActionLoading ? (
+                                        <RefreshCw className="animate-spin text-primary" size={24} />
+                                    ) : (
+                                        <div className="w-8 h-8 rounded-full overflow-hidden shrink-0">
+                                            <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="G" className="w-full h-full" />
+                                        </div>
+                                    )}
+                                    <span className="text-[10px] font-black text-primary uppercase tracking-[0.15em] transition-colors">
+                                        {authActionLoading ? "Authentification..." : "Connexion Professionnelle Google"}
+                                    </span>
                                 </button>
                             </div>
-                        </form>
-                    )}
+                        ) : (
+                            <div className="space-y-6 animate-in fade-in duration-300">
+                                <p className="text-center text-[10px] text-gray-400 font-bold uppercase tracking-widest leading-relaxed max-w-xs mx-auto text-primary">
+                                    ACCÈS SÉCURISÉ CONTRIBUABLES RDC
+                                </p>
+                                <p className="text-center text-[10px] text-gray-400 font-medium leading-relaxed max-w-xs mx-auto">
+                                    Connexion instantanée sans mot de passe via votre adresse e-mail contribuable certifiée Google.
+                                </p>
+                                <button 
+                                    onClick={loginWithGoogle}
+                                    disabled={authActionLoading}
+                                    className={cn(
+                                        "w-full group flex items-center justify-center gap-6 px-10 py-6 bg-white border-2 border-primary/20 rounded-3xl hover:border-primary hover:bg-primary/5 transition-all shadow-xl shadow-primary/5 hover:shadow-primary/10 active:scale-[0.98]",
+                                        authActionLoading && "opacity-50 cursor-not-allowed"
+                                    )}
+                                >
+                                    {authActionLoading ? (
+                                        <RefreshCw className="animate-spin text-primary" size={24} />
+                                    ) : (
+                                        <div className="w-8 h-8 rounded-full overflow-hidden shrink-0">
+                                            <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="G" className="w-full h-full" />
+                                        </div>
+                                    )}
+                                    <span className="text-[10px] font-black text-primary uppercase tracking-[0.15em] transition-colors">
+                                        {authActionLoading ? "Authentification..." : "Connexion Professionnelle Google"}
+                                    </span>
+                                </button>
+                            </div>
+                        )}
+                    </div>
 
                     <footer className="mt-12 text-center">
                         <div className="inline-flex items-center gap-3 px-6 py-2 bg-gray-50 rounded-full border border-gray-100">
                            <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.4)]" />
-                           <span className="text-[9px] font-black text-gray-400 uppercase tracking-widest opacity-60">SÉCURITÉ D'ÉTAT CERTIFIÉE</span>
+                           <span className="text-[9px] font-black text-gray-400 uppercase tracking-widest opacity-60">SÉCURITÉ SANS MOT DE PASSE</span>
                         </div>
                     </footer>
                 </div>
@@ -4974,6 +5735,96 @@ const InternalAuthPage = () => {
     );
 };
 
+const EmailVerificationPage = () => {
+    const { user, logout } = useAuth();
+    const { theme } = useTheme();
+    const [loading, setLoading] = useState(false);
+    const [success, setSuccess] = useState(false);
+
+    const handleVerify = async () => {
+        if (!user?.uid) return;
+        setLoading(true);
+        try {
+            await updateDoc(doc(db, 'users', user.uid), { emailVerified: true });
+            await updateDoc(doc(db, 'contribuables', user.uid), { emailVerified: true }).catch(() => {});
+            setSuccess(true);
+        } catch (err) {
+            console.error("Verification failed", err);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    useEffect(() => {
+        const params = new URLSearchParams(window.location.search);
+        if (
+            params.get('verify') === 'true' || 
+            params.get('emailVerified') === 'true' || 
+            params.get('verify_email') === 'true' || 
+            params.get('mode') === 'verifyEmail'
+        ) {
+            console.log("Auto-confirming email from URL callback parameters");
+            handleVerify();
+        }
+    }, [user?.uid]);
+
+    return (
+        <div className="min-h-screen bg-[#F4F7F6] flex items-center justify-center p-6 relative overflow-hidden font-sans">
+            <div className="absolute inset-0 z-0 opacity-30 pointer-events-none">
+                <div className="absolute -top-20 -left-20 w-[600px] h-[600px] bg-primary rounded-full blur-[200px]" />
+                <div className="absolute -bottom-20 -right-20 w-[400px] h-[400px] bg-primary rounded-full blur-[150px]" />
+            </div>
+
+            <div className="max-w-md w-full bg-white rounded-[3.5rem] shadow-2xl overflow-hidden border border-white relative z-10 p-10 md:p-14 text-center animate-in zoom-in duration-500">
+                <header className="mb-8 font-sans text-center">
+                    <img src={theme.logoUrl} alt="Logo" className="w-20 h-20 mx-auto mb-6 drop-shadow-2xl bg-white p-3 rounded-2xl object-contain border border-gray-100" referrerPolicy="no-referrer" />
+                    <h3 className="text-2xl font-black text-[#2C3E50] mb-2 uppercase tracking-tight italic">Identité Numérique</h3>
+                    <p className="text-[10px] text-orange-600 font-black uppercase tracking-widest pl-1 leading-relaxed">
+                        Validation de messagerie requise
+                    </p>
+                </header>
+
+                <div className="space-y-6">
+                    <p className="text-xs text-gray-500 font-medium leading-relaxed">
+                        Conformément à la réglementation de la Direction Générale des Impôts (DGI), chaque contribuable doit certifier son adresse de correspondance électronique officielle :
+                    </p>
+                    <div className="p-4 bg-gray-50 border border-gray-100 rounded-2xl font-black text-xs text-[#2C3E50] tracking-tight">
+                        {user?.email}
+                    </div>
+
+                    {success ? (
+                        <div className="p-4 bg-green-50 border border-green-100 rounded-2xl text-green-700 text-xs font-bold leading-relaxed flex flex-col items-center gap-2">
+                            <span>✅ Adresse e-mail vérifiée avec succès !</span>
+                            <span className="text-[10px] text-green-600 uppercase tracking-wider animate-pulse">Redirection en cours...</span>
+                        </div>
+                    ) : (
+                        <button 
+                            onClick={handleVerify}
+                            disabled={loading}
+                            id="btn-confirm-email"
+                            className="w-full py-5 bg-[#A93226] text-white rounded-2xl text-[10px] font-black uppercase tracking-[0.2em] shadow-xl hover:brightness-110 active:scale-95 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                        >
+                            {loading ? (
+                                <RefreshCw className="animate-spin" size={16} />
+                            ) : (
+                                "⚠️ Confirmer l'adresse e-mail & Accéder"
+                            )}
+                        </button>
+                    )}
+
+                    <button 
+                        onClick={logout}
+                        id="btn-logout"
+                        className="text-[10px] font-black text-gray-400 uppercase tracking-widest hover:text-red-500 transition-colors pt-2 block mx-auto cursor-pointer"
+                    >
+                        Se déconnecter / Changer de compte
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
 const OnboardingPage = () => {
     const { user, logout } = useAuth();
     const { theme } = useTheme();
@@ -5008,7 +5859,9 @@ const OnboardingPage = () => {
             setFormData(p => ({ ...p, companyPhotoUrl: url }));
             // Also sync auth profile immediately if possible
             const { updateProfile } = await import('firebase/auth');
-            await updateProfile(auth.currentUser!, { photoURL: url });
+            if (auth.currentUser) {
+                await updateProfile(auth.currentUser, { photoURL: url });
+            }
         } catch (err) {
             console.error(err);
         } finally {
@@ -5883,6 +6736,7 @@ const InternalChatPage = () => {
     const [activeTab, setActiveTab] = useState<'public' | 'private'>('public');
     const [uploadProgress, setUploadProgress] = useState<number[]>([]);
     const [showInternalScanner, setShowInternalScanner] = useState(false);
+    const [viewGroupReadersMsgId, setViewGroupReadersMsgId] = useState<string | null>(null);
 
     const addScannedFileToInternalChat = (file: File) => {
         setTempAttachments(prev => [...prev, file]);
@@ -6102,6 +6956,48 @@ const InternalChatPage = () => {
         return () => unsub();
     }, [user?.uid, user?.role, activeTab, selectedAgent?.uid]);
 
+    // Real-time read receipt updates for staff private messages
+    useEffect(() => {
+        if (!user || activeTab !== 'private' || !selectedAgent || messages.length === 0) return;
+
+        // Messages where I am the recipient
+        const unreadMsg = messages.filter(m => m.senderId !== user.uid && (!m.isRead || !m.isReceived));
+        if (unreadMsg.length > 0) {
+            unreadMsg.forEach(async (m) => {
+                try {
+                    const mDocRef = doc(db, 'internal_messages', m.id);
+                    await updateDoc(mDocRef, {
+                        isReceived: true,
+                        isRead: true,
+                        readAt: serverTimestamp()
+                    });
+                } catch (err) {
+                    console.warn("Error marking internal message as read:", err);
+                }
+            });
+        }
+    }, [messages, activeTab, selectedAgent, user]);
+
+    // Real-time group chat read tracking (array of readers)
+    useEffect(() => {
+        if (!user || activeTab !== 'public' || messages.length === 0) return;
+
+        // Group messages where I am not the sender and my uid is not in readBy array
+        const unreadGroupMsg = messages.filter(m => m.senderId !== user.uid && !(m.readBy || []).includes(user.uid));
+        if (unreadGroupMsg.length > 0) {
+            unreadGroupMsg.forEach(async (m) => {
+                try {
+                    const mDocRef = doc(db, 'canal_general_staff', m.id);
+                    await updateDoc(mDocRef, {
+                        readBy: arrayUnion(user.uid)
+                    });
+                } catch (err) {
+                    console.warn("Error marking group message as read in array:", err);
+                }
+            });
+        }
+    }, [messages, activeTab, user]);
+
     const handleSend = async (e?: React.FormEvent) => {
         if (e) e.preventDefault();
         if (uploading) return;
@@ -6144,7 +7040,10 @@ const InternalChatPage = () => {
                 attachments: uploaded,
                 createdAt: serverTimestamp(),
                 participants: activeTab === 'private' ? [user.uid, selectedAgent!.uid].sort() : [],
-                replyTo: replyTo ? { id: replyTo.id, text: replyTo.text, senderName: replyTo.senderName } : null
+                replyTo: replyTo ? { id: replyTo.id, text: replyTo.text, senderName: replyTo.senderName } : null,
+                isReceived: false,
+                isRead: false,
+                readBy: []
             };
 
             const coll = activeTab === 'public' ? 'canal_general_staff' : 'internal_messages';
@@ -6552,9 +7451,70 @@ const InternalChatPage = () => {
                                                 </div>
                                             );
                                         })}
-                                        <p className={cn("text-[8px] font-black uppercase tracking-widest mt-4 opacity-30", m.senderId === user.uid ? "text-right" : "text-left")}>
-                                            {m.createdAt?.toDate().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}
-                                        </p>
+                                        <div className={cn("relative flex items-center gap-1.5 mt-4 text-[8px] font-black uppercase tracking-widest text-[#2C3E50]/70", m.senderId === user.uid ? "justify-end select-none" : "justify-start")}>
+                                            <span 
+                                                onClick={() => {
+                                                    if (m.senderId === user.uid && activeTab === 'public') {
+                                                        setViewGroupReadersMsgId(viewGroupReadersMsgId === m.id ? null : m.id);
+                                                    }
+                                                }}
+                                                className={cn(m.senderId === user.uid && activeTab === 'public' ? "cursor-pointer hover:text-primary transition-colors" : "")}
+                                            >
+                                                {m.createdAt?.toDate ? m.createdAt.toDate().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}
+                                            </span>
+                                            
+                                            {/* private chat checkmarks */}
+                                            {m.senderId === user.uid && activeTab !== 'public' && (
+                                                <span className="text-[10px]" title={m.isRead ? "Lu par le destinataire" : m.isReceived ? "Reçu" : "Envoyé"}>
+                                                    {m.isRead ? (
+                                                        <span className="text-blue-500 font-extrabold">✓✓</span>
+                                                    ) : m.isReceived ? (
+                                                        <span className="text-gray-400 font-extrabold">✓✓</span>
+                                                    ) : (
+                                                        <span className="text-gray-400">✓</span>
+                                                    )}
+                                                </span>
+                                            )}
+
+                                            {/* public group checkmarks (double gray always for anonymity) */}
+                                            {activeTab === 'public' && (
+                                                <span 
+                                                    onClick={() => {
+                                                        if (m.senderId === user.uid) {
+                                                            setViewGroupReadersMsgId(viewGroupReadersMsgId === m.id ? null : m.id);
+                                                        }
+                                                    }}
+                                                    className={cn("text-[10px] text-gray-400 font-extrabold select-none", m.senderId === user.uid ? "cursor-pointer hover:text-primary transition-colors" : "")} 
+                                                    title={m.senderId === user.uid ? "Anonyme - Cliquez pour voir qui a lu" : "Reçu par l'équipe (Discrétion collègues)"}
+                                                >
+                                                    ✓✓
+                                                </span>
+                                            )}
+
+                                            {/* Popover showing readers */}
+                                            {viewGroupReadersMsgId === m.id && m.senderId === user.uid && activeTab === 'public' && (
+                                                <div className="absolute bottom-5 right-0 z-50 bg-white border border-gray-200 p-4 rounded-2xl shadow-xl w-60 text-left animate-in zoom-in duration-150 text-[#2C3E50]">
+                                                    <p className="text-[9px] font-black uppercase tracking-widest text-[#2C3E50] border-b border-gray-100 pb-2 mb-2 flex items-center gap-1.5">
+                                                        👁️ Lecteurs du Message ({m.readBy?.length || 0})
+                                                    </p>
+                                                    {(!m.readBy || m.readBy.length === 0) ? (
+                                                        <p className="text-[8px] text-gray-400 font-black uppercase tracking-widest italic">Aucun lecteur pour le moment</p>
+                                                    ) : (
+                                                        <div className="max-h-24 overflow-y-auto space-y-1 scrollbar-thin">
+                                                            {m.readBy.map((readerId: string) => {
+                                                                const matchingAgent = agents.find(a => a.uid === readerId);
+                                                                return (
+                                                                    <div key={readerId} className="flex items-center gap-2 py-0.5">
+                                                                        <div className="w-1.5 h-1.5 bg-green-500 rounded-full" />
+                                                                        <span className="text-[9px] font-bold text-gray-700">{matchingAgent?.displayName || matchingAgent?.email || 'Collègue DGI'}</span>
+                                                                    </div>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
                                     </div>
                                 </div>
                             ))}

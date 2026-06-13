@@ -24,6 +24,7 @@ export interface AppUser {
   isSetup: boolean;
   isActive: boolean;
   isNew?: boolean;
+  emailVerified?: boolean;
   isSuperContribuable?: boolean;
   assignedContribuables?: string[];
   internalPassword?: string;
@@ -74,8 +75,17 @@ export interface GedItem {
     version: number;
     fileUrl: string;
     annotation?: string;
+    annotFontSize?: number;
     hasSignature?: boolean;
     hasStamp?: boolean;
+    signatureUrl?: string;
+    stampUrl?: string;
+    sigPosition?: { x: number; y: number } | null;
+    sigSize?: { width: number; height: number } | null;
+    stampPosition?: { x: number; y: number } | null;
+    stampSize?: { width: number; height: number } | null;
+    annotPosition?: { x: number; y: number } | null;
+    annotSize?: { width: number; height: number } | null;
     createdBy: string;
     createdByName: string;
     createdByRole?: string;
@@ -123,7 +133,7 @@ export interface Conversation {
   lastMessagePreview: string;
   isReadByContributor: boolean;
   isReadByDGI: boolean;
-  status: 'open' | 'closed' | 'archived';
+  status: 'open' | 'closed' | 'archived' | 'Nouveau' | 'En cours' | 'Relancé' | 'Clôturé';
   companyName?: string;
   contributorName?: string;
   taxNumber?: string;
@@ -143,6 +153,12 @@ export interface Exchange {
   deletedForUser?: boolean;
   deletedForAdmin?: boolean;
   isInternal?: boolean; // New flag for internal notes
+  isReceived?: boolean;
+  isRead?: boolean;
+  readAt?: any;
+  requiresAcknowledgement?: boolean;
+  isCertified?: boolean;
+  certifiedAt?: any;
 }
 
 export interface InternalMessage {
@@ -163,6 +179,10 @@ export interface InternalMessage {
     text: string;
     senderName: string;
   } | null;
+  isReceived?: boolean;
+  isRead?: boolean;
+  readAt?: any;
+  readBy?: string[];
 }
 
 export interface ThemeConfig {
